@@ -188,6 +188,9 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
       entries: {status: "paid"}
 ```
 
+`transaction` принимает и более свободные формы payload (для клиентов, которые не могут строго уложиться в схему):  
+`{operations:[...]}`, `{payload:{operations:[...]}}`, `{"raw":"{\"operations\":[...]}"}`.
+
 ### Удаление
 ```
 Используй transaction:

@@ -703,25 +703,11 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "operations": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "type": {"type": "string", "enum": ["insert", "update", "delete"]},
-                                "entity": {
-                                    "type": "object",
-                                    "properties": {"schema": {"type": "string"}, "name": {"type": "string"}},
-                                    "required": ["schema", "name"],
-                                },
-                                "entries": {"type": "object"},
-                                "id": {"type": "integer"},
-                            },
-                            "required": ["type", "entity"],
-                        },
-                    }
+                    "operations": {"description": "Preferred payload: array of operations"},
+                    "payload": {"description": "Alternative payload container; may include `operations`"},
+                    "raw": {"description": "Alternative raw JSON string/object with operations"},
                 },
-                "required": ["operations"],
+                "additionalProperties": True,
             },
         ),
         types.Tool(
@@ -1080,6 +1066,44 @@ def _require_write():
         raise PermissionError("This MCP server is running in read-only mode (OZMA_READONLY=true). Mutations are disabled.")
 
 
+def _coerce_transaction_operations(args: dict) -> list[dict]:
+    """
+    Accept permissive transaction payloads to avoid schema-level blocking.
+    Supported forms:
+    - {"operations": [...]}
+    - {"operations": "{\"operations\":[...]}"}
+    - {"payload": {"operations":[...]}}
+    - {"raw": "...json..."}
+    - [...] (if caller passed array into one of above fields)
+    """
+    def _parse_json_maybe(v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    candidates = [
+        args.get("operations"),
+        args.get("payload"),
+        args.get("raw"),
+        args,
+    ]
+    for cand in candidates:
+        v = _parse_json_maybe(cand)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            inner = _parse_json_maybe(v.get("operations"))
+            if isinstance(inner, list):
+                return inner
+    raise ValueError(
+        "Transaction payload must contain operations array. "
+        "Accepted forms: `{operations:[...]}`, `{payload:{operations:[...]}}`, or JSON string with operations."
+    )
+
+
 async def _dispatch(name: str, args: dict) -> Any:
     match name:
         case "check_access":
@@ -1106,7 +1130,7 @@ async def _dispatch(name: str, args: dict) -> Any:
             )
         case "transaction":
             _require_write()
-            return await _tool_transaction(args["operations"])
+            return await _tool_transaction(_coerce_transaction_operations(args))
         case "run_action":
             _require_write()
             return await _tool_run_action(args["schema"], args["action_name"], args.get("args", {}))
