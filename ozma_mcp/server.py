@@ -229,6 +229,13 @@ def _augment_funql_error(err: dict, query: str) -> dict:
             "In `public.actions`, use `a.name as action_name` and "
             "`join public.schemas s on a.schema_id = s.id` for schema name."
         )
+    if "entity not found" in message_l and "modules_table" in query_l:
+        err = dict(err)
+        err["hint"] = (
+            "Modules may be exposed as user view `admin.modules_table` (not entity). "
+            "Use module tools (`list_modules`, `get_module_code`, `search_in_modules`) "
+            "which read from `/views/by_name/admin/modules_table`."
+        )
     if "unknown field" in message_l and ("&admin." in query_l or "from admin." in query_l):
         err = dict(err)
         err["hint"] = (
@@ -867,8 +874,27 @@ async def list_tools() -> list[types.Tool]:
             description="Get the full JavaScript source code of a specific module from `admin.modules_table`.",
             inputSchema={
                 "type": "object",
-                "properties": {"module_name": {"type": "string"}},
-                "required": ["module_name"],
+                "properties": {
+                    "module_name": {"type": "string", "description": "Module name, e.g. `pl_report.mjs`"},
+                    "module_id": {"type": "integer", "description": "Optional direct module id"},
+                    "full": {"type": "boolean", "description": "If true, disable response truncation for this call"},
+                },
+            },
+        ),
+        types.Tool(
+            name="analyze_module_performance",
+            description=(
+                "Analyze JS module performance risks and optimization opportunities. "
+                "Loads module code via admin.modules_table and returns prioritized findings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "module_name": {"type": "string", "description": "Module name, e.g. `pl_report.mjs`"},
+                    "module_id": {"type": "integer", "description": "Optional direct module id"},
+                    "include_snippets": {"type": "boolean", "description": "Include short code excerpts in findings (default: true)"},
+                    "max_findings": {"type": "integer", "description": "Max findings to return (default: 20)", "minimum": 1, "maximum": 100},
+                },
             },
         ),
         types.Tool(
@@ -1038,7 +1064,7 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     args = arguments or {}
-    full_allowed = {"get_action_code", "get_trigger_code", "get_user_view_query"}
+    full_allowed = {"get_action_code", "get_trigger_code", "get_user_view_query", "get_module_code"}
     trim_override = False if (name in full_allowed and bool(args.get("full"))) else None
     try:
         result = await _dispatch(name, args)
@@ -1122,7 +1148,17 @@ async def _dispatch(name: str, args: dict) -> Any:
         case "search_in_modules":
             return await _tool_search_in_modules(args["text"])
         case "get_module_code":
-            return await _tool_get_module_code(args["module_name"])
+            return await _tool_get_module_code(
+                module_name=args.get("module_name"),
+                module_id=args.get("module_id"),
+            )
+        case "analyze_module_performance":
+            return await _tool_analyze_module_performance(
+                module_name=args.get("module_name"),
+                module_id=args.get("module_id"),
+                include_snippets=args.get("include_snippets", True),
+                max_findings=args.get("max_findings", 20),
+            )
         case "list_modules":
             return await _tool_list_modules()
         case "search_in_actions":
@@ -1561,37 +1597,82 @@ async def _tool_get_trigger_code(
 
 # --- Modules ---
 
-async def _modules_code_field() -> str:
-    """Detect JS code field name in admin.modules_table (cached)."""
-    hit = _cache.get("modules_code_field")
-    if hit:
-        return hit
-    fields = await _tool_list_entity_fields("admin", "modules_table")
-    col_names = {c.get("field_name") or c.get("name") for c in (fields.get("columns") or [])}
-    for candidate in ("code", "function", "source", "body", "content"):
-        if candidate in col_names:
-            _cache.set("modules_code_field", candidate, ttl=3600)
-            return candidate
-    _cache.set("modules_code_field", "code", ttl=3600)
-    return "code"
+def _module_pick_name(row: dict) -> Optional[str]:
+    for key in ("name", "module_name", "module", "file_name", "filename", "path"):
+        v = row.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _module_pick_code(row: dict) -> str:
+    for key in ("code", "function", "source", "body", "content", "script", "module_code"):
+        v = row.get(key)
+        if isinstance(v, str) and v:
+            return v
+    # Fallback: pick the longest string-like field, often this is module source text.
+    best = ""
+    for v in row.values():
+        if isinstance(v, str) and len(v) > len(best):
+            best = v
+    return best
+
+
+def _normalize_module_row(row: dict) -> dict:
+    module_id = row.get("id") or row.get("_id")
+    name = _module_pick_name(row)
+    code = _module_pick_code(row)
+    if not name and module_id is not None:
+        name = f"module_{module_id}"
+    return {"id": module_id, "name": name, "code": code, "_raw": row}
 
 
 async def _fetch_all_modules() -> list[dict]:
-    """Fetch all modules with code (cached)."""
+    """Fetch modules (prefer admin.modules_table view; fallback to entity query)."""
     hit = _cache.get("all_modules")
     if hit is not None:
         return hit
-    code_field = await _modules_code_field()
-    rows = await _tool_funql_query(
-        f"select id, name, {code_field} as code from admin.modules_table order by name", {}
-    )
-    _cache.set("all_modules", rows or [])
-    return rows or []
+
+    # Preferred: user view `/views/by_name/admin/modules_table/...`
+    try:
+        rows = await _tool_named_view_query("admin", "modules_table", {}, limit=5000)
+        if isinstance(rows, list):
+            mods = [_normalize_module_row(r) for r in rows]
+            mods = [m for m in mods if m.get("name")]
+            _cache.set("all_modules", mods, ttl=600)
+            return mods
+    except Exception:
+        pass
+
+    # Fallback: old direct entity query (for older installations).
+    try:
+        fields = await _tool_list_entity_fields("admin", "modules_table")
+        col_names = {c.get("field_name") or c.get("name") for c in (fields.get("columns") or [])}
+        code_field = next((c for c in ("code", "function", "source", "body", "content") if c in col_names), "code")
+        rows = await _tool_funql_query(
+            f"select id, name, {code_field} as code from admin.modules_table order by name", {}
+        )
+        mods = [_normalize_module_row(r) for r in (rows or [])]
+        mods = [m for m in mods if m.get("name")]
+        _cache.set("all_modules", mods, ttl=600)
+        return mods
+    except Exception as e:
+        payload = _exception_payload(e)
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "error": "Cannot fetch modules from admin.modules_table (view/entity).",
+                    "type": "modules_unavailable",
+                    "details": payload,
+                    "hint": "Verify named view `admin.modules_table` exists and is accessible.",
+                }
+            )
+        )
 
 
 async def _tool_list_modules() -> list[dict]:
     modules = await _fetch_all_modules()
-    return [{"id": m.get("_id") or m.get("id"), "name": m.get("name")} for m in modules]
+    return [{"id": m.get("id"), "name": m.get("name")} for m in modules]
 
 
 async def _tool_search_in_modules(text: str) -> list[dict]:
@@ -1604,12 +1685,232 @@ async def _tool_search_in_modules(text: str) -> list[dict]:
     ]
 
 
-async def _tool_get_module_code(module_name: str) -> dict:
+def _normalize_module_name(name: str) -> str:
+    return (name or "").strip().lower().removesuffix(".mjs")
+
+
+async def _tool_get_module_code(module_name: Optional[str] = None, module_id: Optional[int] = None) -> dict:
     modules = await _fetch_all_modules()
+    if module_id is not None:
+        for m in modules:
+            if m.get("id") == module_id:
+                return {"id": m.get("id"), "name": m.get("name"), "code": m.get("code")}
+        return {"error": f"Module id={module_id} not found", "type": "not_found"}
+
+    if not module_name:
+        return {
+            "error": "Provide `module_name` or `module_id`.",
+            "type": "validation",
+            "example": {"module_name": "pl_report.mjs"},
+        }
+
+    wanted = _normalize_module_name(module_name)
     for m in modules:
-        if m.get("name") == module_name:
-            return {"name": m.get("name"), "code": m.get("code")}
-    return {"error": f"Module '{module_name}' not found", "type": "not_found"}
+        name = m.get("name") or ""
+        if name == module_name or _normalize_module_name(name) == wanted:
+            return {"id": m.get("id"), "name": name, "code": m.get("code")}
+    candidates = [m.get("name") for m in modules if isinstance(m.get("name"), str)]
+    return {
+        "error": f"Module '{module_name}' not found",
+        "type": "not_found",
+        "hint": "Use list_modules, then pass exact `module_name` or `module_id`.",
+        "known_modules_sample": candidates[:30],
+    }
+
+
+def _line_number_at(text: str, index: int) -> int:
+    return text.count("\n", 0, max(0, index)) + 1
+
+
+def _make_finding(
+    *,
+    kind: str,
+    severity: str,
+    title: str,
+    detail: str,
+    line: Optional[int] = None,
+    snippet: Optional[str] = None,
+) -> dict:
+    out = {"kind": kind, "severity": severity, "title": title, "detail": detail}
+    if line is not None:
+        out["line"] = line
+    if snippet:
+        out["snippet"] = snippet
+    return out
+
+
+def _analyze_js_performance(code: str, include_snippets: bool = True) -> dict:
+    findings: list[dict] = []
+    code_len = len(code)
+    lines = code.splitlines()
+    line_count = len(lines)
+
+    # 1) await inside loops
+    await_in_loop = re.finditer(
+        r"(?is)\b(for\s*\(.*?\)|for\s+await\s*\(.*?\)|while\s*\(.*?\)|do\s*\{.*?\}\s*while\s*\(.*?\))[\s\S]{0,700}?\bawait\b",
+        code,
+    )
+    for m in await_in_loop:
+        snippet = code[m.start(): min(m.start() + 220, len(code))] if include_snippets else None
+        findings.append(
+            _make_finding(
+                kind="await_in_loop",
+                severity="high",
+                title="Sequential await in loop",
+                detail="Potential N+1 latency pattern; consider batching with Promise.all where ordering is not required.",
+                line=_line_number_at(code, m.start()),
+                snippet=snippet,
+            )
+        )
+
+    # 2) nested loops
+    nested_loop = re.finditer(
+        r"(?is)\bfor\s*\(.*?\)\s*\{[\s\S]{0,600}?\bfor\s*\(",
+        code,
+    )
+    for m in nested_loop:
+        snippet = code[m.start(): min(m.start() + 220, len(code))] if include_snippets else None
+        findings.append(
+            _make_finding(
+                kind="nested_loops",
+                severity="high",
+                title="Nested loops detected",
+                detail="May be O(n^2)+ on large datasets; consider pre-indexing with Map/Object lookups.",
+                line=_line_number_at(code, m.start()),
+                snippet=snippet,
+            )
+        )
+
+    # 3) repeated JSON parse/stringify
+    json_ops = len(re.findall(r"\bJSON\.(parse|stringify)\s*\(", code))
+    if json_ops >= 5:
+        findings.append(
+            _make_finding(
+                kind="json_hot_path",
+                severity="medium",
+                title="Many JSON parse/stringify operations",
+                detail=f"Detected {json_ops} JSON conversions. Cache parsed objects and avoid repeat serialization in hot paths.",
+            )
+        )
+
+    # 4) sort in potential loop context
+    for m in re.finditer(r"\.sort\s*\(", code):
+        context_start = max(0, m.start() - 220)
+        context = code[context_start:m.start()]
+        if re.search(r"\b(for|while)\b", context):
+            snippet = code[max(0, m.start() - 120): min(m.start() + 120, len(code))] if include_snippets else None
+            findings.append(
+                _make_finding(
+                    kind="sort_in_loop",
+                    severity="high",
+                    title="Sort call near loop context",
+                    detail="Repeated sorting can dominate runtime. Sort once outside loops or maintain ordered structure incrementally.",
+                    line=_line_number_at(code, m.start()),
+                    snippet=snippet,
+                )
+            )
+
+    # 5) repeated regex creation
+    regex_literal_count = len(re.findall(r"/[^/\n]{1,80}/[gimsuy]*", code))
+    regex_ctor_count = len(re.findall(r"\bnew\s+RegExp\s*\(", code))
+    if regex_ctor_count >= 3:
+        findings.append(
+            _make_finding(
+                kind="regex_ctor_hot_path",
+                severity="medium",
+                title="Frequent RegExp construction",
+                detail=f"Detected {regex_ctor_count} `new RegExp(...)` calls. Reuse compiled regexes where possible.",
+            )
+        )
+    if regex_literal_count >= 30:
+        findings.append(
+            _make_finding(
+                kind="many_regex_literals",
+                severity="low",
+                title="Large number of regex literals",
+                detail=f"Detected {regex_literal_count} regex literals. Validate they are not recreated in tight loops/functions.",
+            )
+        )
+
+    # 6) map/filter/reduce chaining
+    chain_hits = re.finditer(r"\.(map|filter|reduce)\s*\([^)]*\)\s*\.(map|filter|reduce)\s*\(", code)
+    for m in chain_hits:
+        snippet = code[max(0, m.start() - 80): min(m.start() + 160, len(code))] if include_snippets else None
+        findings.append(
+            _make_finding(
+                kind="array_chain",
+                severity="medium",
+                title="Chained array transforms",
+                detail="Chained map/filter/reduce creates intermediate arrays; combine passes in hot paths.",
+                line=_line_number_at(code, m.start()),
+                snippet=snippet,
+            )
+        )
+
+    # 7) repeated Date construction
+    date_news = len(re.findall(r"\bnew\s+Date\s*\(", code))
+    if date_news >= 10:
+        findings.append(
+            _make_finding(
+                kind="many_date_allocs",
+                severity="low",
+                title="Many Date allocations",
+                detail=f"Detected {date_news} `new Date(...)` calls. Cache timestamps in loops where possible.",
+            )
+        )
+
+    # Summary metrics
+    complexity_signals = {
+        "line_count": line_count,
+        "char_count": code_len,
+        "await_count": len(re.findall(r"\bawait\b", code)),
+        "loop_count": len(re.findall(r"\b(for|while)\b", code)),
+        "function_count": len(re.findall(r"\bfunction\b|=>", code)),
+    }
+
+    # Sort findings by severity
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: (severity_rank.get(f.get("severity", "low"), 9), f.get("line", 10**9)))
+
+    recommendations = [
+        "Batch independent async calls with Promise.all / Promise.allSettled.",
+        "Pre-index arrays with Map/Object before joins/merges to avoid O(n^2).",
+        "Move invariant parsing/regex/date work out of loops.",
+        "Profile with representative data and measure before/after (execution time and allocations).",
+    ]
+
+    return {
+        "metrics": complexity_signals,
+        "findings": findings,
+        "recommendations": recommendations,
+    }
+
+
+async def _tool_analyze_module_performance(
+    module_name: Optional[str] = None,
+    module_id: Optional[int] = None,
+    include_snippets: bool = True,
+    max_findings: int = 20,
+) -> dict:
+    module = await _tool_get_module_code(module_name=module_name, module_id=module_id)
+    if "error" in module:
+        return module
+    code = module.get("code") or ""
+    if not isinstance(code, str) or not code.strip():
+        return {
+            "error": "Module code is empty or unavailable",
+            "type": "no_code",
+            "module": {"id": module.get("id"), "name": module.get("name")},
+        }
+    analysis = _analyze_js_performance(code, include_snippets=include_snippets)
+    findings = analysis.get("findings", [])
+    if len(findings) > max_findings:
+        analysis["findings"] = findings[:max_findings] + [
+            {"kind": "truncated", "severity": "low", "title": "Findings truncated", "detail": f"Returned first {max_findings} findings."}
+        ]
+    analysis["module"] = {"id": module.get("id"), "name": module.get("name")}
+    analysis["ok"] = True
+    return analysis
 
 
 # --- Search in actions / triggers ---
