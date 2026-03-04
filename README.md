@@ -10,11 +10,14 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `funql_query` | Выполнить произвольный FunQL SELECT запрос |
 | `named_view_query` | Получить данные из именованного user view |
 | `named_view_info` | Получить метаданные (колонки, типы) именованного view |
+| `list_user_views` | Показать доступные именованные user view (для диагностики 404) |
 | `transaction` | Выполнить атомарную транзакцию (insert / update / delete) |
 | `run_action` | Запустить серверный action |
 | `list_schemas` | Список схем в базе |
 | `list_entities` | Список сущностей (таблиц) в схеме |
 | `list_entity_fields` | Список полей сущности (column + computed) |
+| `search_in_metadata` | Поиск подстроки в метаданных схемы (expressions/defaults/role rules/views) |
+| `where_used_field` | Точечный поиск использования поля по `schema/entity/field` в views/actions/triggers/metadata |
 
 ## Установка
 
@@ -96,6 +99,8 @@ mcp_servers:
 Используй funql_query:
   query: "select id, name, email from usr.customers where active = true limit 10"
 ```
+
+Важно: в FunQL не поддерживается `SELECT *`. Нужно перечислять колонки явно.
 
 ### Вставка записи
 ```
