@@ -1084,20 +1084,50 @@ def _coerce_transaction_operations(args: dict) -> list[dict]:
                 return v
         return v
 
-    candidates = [
-        args.get("operations"),
-        args.get("payload"),
-        args.get("raw"),
-        args,
-    ]
+    def _looks_like_operation(obj: Any) -> bool:
+        return isinstance(obj, dict) and any(k in obj for k in ("type", "entity", "entries", "id"))
+
+    def _find_operations_deep(obj: Any, depth: int = 0) -> Optional[list[dict]]:
+        if depth > 6:
+            return None
+        obj = _parse_json_maybe(obj)
+        if isinstance(obj, list):
+            if not obj:
+                return obj
+            if all(isinstance(i, dict) for i in obj) and any(_looks_like_operation(i) for i in obj):
+                return obj
+            for item in obj:
+                found = _find_operations_deep(item, depth + 1)
+                if found is not None:
+                    return found
+            return None
+        if isinstance(obj, dict):
+            # Canonical key first
+            if "operations" in obj:
+                found = _find_operations_deep(obj.get("operations"), depth + 1)
+                if found is not None:
+                    return found
+            # Some clients wrap payload/body/data/params/transaction/etc.
+            for k in ("payload", "raw", "data", "body", "params", "transaction", "tx", "request", "input", "value"):
+                if k in obj:
+                    found = _find_operations_deep(obj.get(k), depth + 1)
+                    if found is not None:
+                        return found
+            # Single operation object
+            if _looks_like_operation(obj):
+                return [obj]
+            # Last resort: inspect all nested values
+            for v in obj.values():
+                found = _find_operations_deep(v, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    candidates = [args]
     for cand in candidates:
-        v = _parse_json_maybe(cand)
-        if isinstance(v, list):
-            return v
-        if isinstance(v, dict):
-            inner = _parse_json_maybe(v.get("operations"))
-            if isinstance(inner, list):
-                return inner
+        found = _find_operations_deep(cand)
+        if found is not None:
+            return found
     raise ValueError(
         "Transaction payload must contain operations array. "
         "Accepted forms: `{operations:[...]}`, `{payload:{operations:[...]}}`, or JSON string with operations."
