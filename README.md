@@ -2,6 +2,10 @@
 
 MCP-сервер для работы с OzmaDB через REST API. Подключается к Claude Code, Codex и любому другому MCP-совместимому клиенту.
 
+Также сервер публикует MCP resource с документацией по OzmaDB/FunQL из `AGENTS.md`, чтобы агент мог читать её напрямую через MCP.
+
+Дополнительно сервер публикует разделы wiki.ozma.io как MCP resources из локального snapshot (`docs/wiki/*.md`), чтобы не делать HTTP-запросы к wiki при каждом чтении.
+
 ## Возможности
 
 | Tool | Описание |
@@ -43,6 +47,14 @@ python3 -m venv .venv
 | `OZMA_CLIENT_SECRET` | *(пусто)* | OIDC client_secret |
 | `OZMA_USERNAME` | *(пусто)* | Логин пользователя |
 | `OZMA_PASSWORD` | *(пусто)* | Пароль пользователя |
+| `OZMA_BRIEF_TOOL_META` | `true` | Сжимает `list_tools` (короткие описания, без `description` в inputSchema) |
+| `OZMA_COMPACT_JSON` | `true` | Возвращает minified JSON в tool responses (меньше токенов) |
+| `OZMA_TRIM_LONG_FIELDS` | `true` | Обрезает длинные строки и большие массивы в tool responses |
+| `OZMA_MAX_ITEMS` | `50` | Максимум элементов массива в ответе tool |
+| `OZMA_MAX_STRING_CHARS` | `1500` | Лимит символов для обычных строковых полей |
+| `OZMA_MAX_CODE_CHARS` | `4000` | Лимит символов для длинных полей `code/query/expression/...` |
+| `OZMA_DOC_COMPACT` | `true` | Обрезает длинные `read_resource` документы |
+| `OZMA_DOC_MAX_CHARS` | `24000` | Лимит символов для одного resource документа |
 
 ## Подключение к Claude Code
 
@@ -97,6 +109,44 @@ mcp_servers:
 ```
 
 ## Примеры использования
+
+### Прочитать документацию через MCP resource
+```
+Используй MCP resource:
+  uri: ozma://docs/agents
+```
+
+URI ресурса фиксированный: `ozma://docs/agents` (mime type: `text/markdown`).
+
+### Прочитать wiki-разделы через MCP resource
+```
+Используй MCP resource:
+  uri: ozma://docs/wiki
+```
+
+Доступные URI:
+- `ozma://docs/wiki` — индекс разделов
+- `ozma://docs/wiki/full` — агрегированный bundle всех разделов
+- `ozma://docs/wiki/funql`
+- `ozma://docs/wiki/fundb`
+- `ozma://docs/wiki/fundb-api`
+- `ozma://docs/wiki/funapp/menu`
+- `ozma://docs/wiki/funapp/table`
+- `ozma://docs/wiki/funapp/form`
+- `ozma://docs/wiki/funapp/board`
+- `ozma://docs/wiki/funapp/tree`
+- `ozma://docs/wiki/funapp/timeline`
+- `ozma://docs/wiki/funapp/settings`
+- `ozma://docs/wiki/color-variants`
+
+Совместимость: также поддерживаются алиасы `funapp-menu`, `funapp-table`, `funapp-form`, `funapp-board`, `funapp-tree`, `funapp-timeline`, `funapp-settings`.
+
+### Обновить локальный snapshot wiki
+```bash
+.venv/bin/python scripts/export_wiki_docs.py
+```
+
+После обновления snapshot MCP начнет отдавать новые тексты сразу (после рестарта сервера/сессии клиента).
 
 ### FunQL запрос
 ```

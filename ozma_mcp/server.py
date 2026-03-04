@@ -4,10 +4,12 @@ Provides tools for interacting with OzmaDB (FunDB) via its REST API.
 """
 
 import asyncio
+import html
 import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -29,12 +31,55 @@ OZMA_CLIENT_SECRET = os.environ.get("OZMA_CLIENT_SECRET", "")
 OZMA_USERNAME = os.environ.get("OZMA_USERNAME", "")
 OZMA_PASSWORD = os.environ.get("OZMA_PASSWORD", "")
 OZMA_READONLY = os.environ.get("OZMA_READONLY", "").lower() in ("1", "true", "yes")
+OZMA_BRIEF_TOOL_META = os.environ.get("OZMA_BRIEF_TOOL_META", "true").lower() in ("1", "true", "yes")
+OZMA_COMPACT_JSON = os.environ.get("OZMA_COMPACT_JSON", "true").lower() in ("1", "true", "yes")
+OZMA_TRIM_LONG_FIELDS = os.environ.get("OZMA_TRIM_LONG_FIELDS", "true").lower() in ("1", "true", "yes")
+OZMA_MAX_ITEMS = int(os.environ.get("OZMA_MAX_ITEMS", "50"))
+OZMA_MAX_STRING_CHARS = int(os.environ.get("OZMA_MAX_STRING_CHARS", "1500"))
+OZMA_MAX_CODE_CHARS = int(os.environ.get("OZMA_MAX_CODE_CHARS", "4000"))
+OZMA_DOC_COMPACT = os.environ.get("OZMA_DOC_COMPACT", "true").lower() in ("1", "true", "yes")
+OZMA_DOC_MAX_CHARS = int(os.environ.get("OZMA_DOC_MAX_CHARS", "24000"))
 
 # Metadata cache TTL in seconds (5 minutes)
 CACHE_TTL = int(os.environ.get("OZMA_CACHE_TTL", "300"))
 
 if not OZMA_API_BASE.endswith("/"):
     OZMA_API_BASE += "/"
+
+AGENTS_DOC_URI = "ozma://docs/agents"
+AGENTS_DOC_PATH = Path(__file__).resolve().parent.parent / "AGENTS.md"
+WIKI_DOC_INDEX_URI = "ozma://docs/wiki"
+WIKI_DOC_FULL_URI = "ozma://docs/wiki/full"
+WIKI_DOC_PREFIX = "ozma://docs/wiki/"
+WIKI_DOCS_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
+WIKI_INDEX_PATH = WIKI_DOCS_DIR / "index.md"
+WIKI_FULL_PATH = WIKI_DOCS_DIR / "full.md"
+
+# Wiki pages requested by user. These are published as MCP resources.
+WIKI_DOCS: dict[str, dict[str, str]] = {
+    "funql": {"title": "FunQL", "url": "https://wiki.ozma.io/en/docs/funql"},
+    "fundb": {"title": "FunDB", "url": "https://wiki.ozma.io/en/docs/fundb"},
+    "fundb-api": {"title": "FunDB API", "url": "https://wiki.ozma.io/en/docs/fundb-api"},
+    "funapp/menu": {"title": "FunApp Menu", "url": "https://wiki.ozma.io/en/docs/funapp/menu"},
+    "funapp/table": {"title": "FunApp Table", "url": "https://wiki.ozma.io/en/docs/funapp/table"},
+    "funapp/form": {"title": "FunApp Form", "url": "https://wiki.ozma.io/en/docs/funapp/form"},
+    "funapp/board": {"title": "FunApp Board", "url": "https://wiki.ozma.io/en/docs/funapp/board"},
+    "funapp/tree": {"title": "FunApp Tree", "url": "https://wiki.ozma.io/en/docs/funapp/tree"},
+    "funapp/timeline": {"title": "FunApp Timeline", "url": "https://wiki.ozma.io/en/docs/funapp/timeline"},
+    "funapp/settings": {"title": "FunApp Settings", "url": "https://wiki.ozma.io/en/docs/funapp/settings"},
+    "color-variants": {"title": "Color Variants", "url": "https://wiki.ozma.io/en/docs/color-variants"},
+}
+
+# Backward-compatible aliases for previously exposed slugs.
+WIKI_DOC_ALIASES: dict[str, str] = {
+    "funapp-menu": "funapp/menu",
+    "funapp-table": "funapp/table",
+    "funapp-form": "funapp/form",
+    "funapp-board": "funapp/board",
+    "funapp-tree": "funapp/tree",
+    "funapp-timeline": "funapp/timeline",
+    "funapp-settings": "funapp/settings",
+}
 
 # ---------------------------------------------------------------------------
 # HTTP client
@@ -263,6 +308,181 @@ def _excerpt(code: str, needle: str, context: int = 120) -> str:
     return snippet
 
 
+def _strip_schema_descriptions(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {k: _strip_schema_descriptions(v) for k, v in node.items() if k != "description"}
+    if isinstance(node, list):
+        return [_strip_schema_descriptions(v) for v in node]
+    return node
+
+
+def _brief_text(text: str) -> str:
+    txt = (text or "").strip()
+    if not txt:
+        return txt
+    first = re.split(r"(?<=[.!?])\s+", txt, maxsplit=1)[0]
+    return first if first else txt
+
+
+def _compact_tool_defs(tools: list[types.Tool]) -> list[types.Tool]:
+    if not OZMA_BRIEF_TOOL_META:
+        return tools
+    compact: list[types.Tool] = []
+    for tool in tools:
+        input_schema = _strip_schema_descriptions(tool.inputSchema or {})
+        compact.append(
+            tool.model_copy(
+                update={
+                    "description": _brief_text(tool.description or ""),
+                    "inputSchema": input_schema,
+                }
+            )
+        )
+    return compact
+
+
+def _json_dump(data: Any) -> str:
+    if OZMA_TRIM_LONG_FIELDS:
+        data = _compact_value(data)
+    if OZMA_COMPACT_JSON:
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    omitted = len(value) - max_chars
+    return value[:max_chars] + f"\n...[truncated {omitted} chars]"
+
+
+def _compact_value(value: Any, path: tuple[str, ...] = ()) -> Any:
+    # Aggressive payload compaction to reduce token usage in MCP responses.
+    if isinstance(value, str):
+        key = path[-1] if path else ""
+        max_chars = OZMA_MAX_CODE_CHARS if key in {"code", "query", "expression", "function", "procedure", "script"} else OZMA_MAX_STRING_CHARS
+        return _truncate_text(value, max_chars)
+    if isinstance(value, list):
+        if len(value) > OZMA_MAX_ITEMS:
+            head = [_compact_value(v, path + ("[]",)) for v in value[:OZMA_MAX_ITEMS]]
+            head.append({"_truncated": True, "_total": len(value), "_returned": OZMA_MAX_ITEMS})
+            return head
+        return [_compact_value(v, path + ("[]",)) for v in value]
+    if isinstance(value, dict):
+        return {k: _compact_value(v, path + (str(k),)) for k, v in value.items()}
+    return value
+
+
+def _compact_doc_text(text: str, uri: str) -> str:
+    if not OZMA_DOC_COMPACT:
+        return text
+    if len(text) <= OZMA_DOC_MAX_CHARS:
+        return text
+    omitted = len(text) - OZMA_DOC_MAX_CHARS
+    return (
+        text[:OZMA_DOC_MAX_CHARS]
+        + f"\n\n---\nTruncated for token saving: omitted {omitted} chars from {uri}.\n"
+        "Set OZMA_DOC_COMPACT=false (or increase OZMA_DOC_MAX_CHARS) to read full text.\n"
+    )
+
+
+def _wiki_html_to_text(page_html: str) -> str:
+    """
+    Convert wiki HTML into plain markdown-like text.
+    Keeps content complete while removing navigation/chrome tags.
+    """
+    body = page_html
+    for tag in ("main", "article", "body"):
+        m = re.search(rf"(?is)<{tag}\b[^>]*>(.*?)</{tag}>", page_html)
+        if m:
+            body = m.group(1)
+            break
+
+    body = re.sub(r"(?is)<(script|style|noscript|svg|canvas)\b[^>]*>.*?</\1>", "", body)
+    body = re.sub(r"(?i)<br\s*/?>", "\n", body)
+    body = re.sub(r"(?i)</(p|div|section|article|blockquote)>", "\n\n", body)
+    body = re.sub(r"(?i)</(h1|h2|h3|h4|h5|h6)>", "\n\n", body)
+    body = re.sub(r"(?i)</li>", "\n", body)
+    body = re.sub(r"(?i)<li\b[^>]*>", "- ", body)
+    body = re.sub(r"(?i)</tr>", "\n", body)
+    body = re.sub(r"(?is)<[^>]+>", "", body)
+    text = html.unescape(body)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _wiki_snapshot_path(slug: str) -> Path:
+    return WIKI_DOCS_DIR / f"{slug}.md"
+
+
+def _read_local_wiki_doc(slug: str) -> Optional[str]:
+    path = _wiki_snapshot_path(slug)
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+async def _fetch_wiki_doc(slug: str) -> str:
+    slug = WIKI_DOC_ALIASES.get(slug, slug)
+    if slug not in WIKI_DOCS:
+        raise FileNotFoundError(f"Unknown wiki section: {slug}")
+
+    local = _read_local_wiki_doc(slug)
+    if local is not None:
+        return local
+
+    cache_key = f"wiki_doc:{slug}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+    meta = WIKI_DOCS[slug]
+    r = await _get_client().get(meta["url"], follow_redirects=True)
+    if r.status_code != 200:
+        raise RuntimeError(f"Wiki request failed ({r.status_code}) for {meta['url']}")
+    extracted = _wiki_html_to_text(r.text)
+    content = (
+        f"# {meta['title']}\n\n"
+        f"Source: {meta['url']}\n\n"
+        f"{extracted}\n"
+    )
+    _cache.set(cache_key, content, ttl=max(60, min(CACHE_TTL, 3600)))
+    return content
+
+
+async def _wiki_index_doc() -> str:
+    if WIKI_INDEX_PATH.exists():
+        return WIKI_INDEX_PATH.read_text(encoding="utf-8")
+    lines = [
+        "# Ozma Wiki Documentation Index",
+        "",
+        "MCP resources generated from wiki.ozma.io pages:",
+        "",
+        f"- `ozma://docs/agents` — local AGENTS.md (curated guide)",
+        f"- `{WIKI_DOC_INDEX_URI}` — this index",
+        f"- `{WIKI_DOC_FULL_URI}` — aggregated text of all sections",
+        "",
+        "## Sections",
+    ]
+    for slug, meta in WIKI_DOCS.items():
+        lines.append(f"- `{WIKI_DOC_PREFIX}{slug}` — {meta['title']} ({meta['url']})")
+    lines.append("")
+    return "\n".join(lines)
+
+
+async def _wiki_full_doc() -> str:
+    if WIKI_FULL_PATH.exists():
+        return WIKI_FULL_PATH.read_text(encoding="utf-8")
+    chunks: list[str] = ["# Ozma Wiki Full Documentation Bundle", ""]
+    for slug, meta in WIKI_DOCS.items():
+        chunks.append(f"## {meta['title']}")
+        chunks.append("")
+        chunks.append(await _fetch_wiki_doc(slug))
+        chunks.append("")
+    return "\n".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -270,10 +490,76 @@ def _excerpt(code: str, needle: str, context: int = 120) -> str:
 app = Server("ozma-mcp")
 
 
+@app.list_resources()
+async def list_resources() -> list[types.Resource]:
+    size: int | None = None
+    if AGENTS_DOC_PATH.exists():
+        size = AGENTS_DOC_PATH.stat().st_size
+    resources = [
+        types.Resource(
+            name="ozmadb_agents_doc",
+            title="OzmaDB Agent Documentation",
+            uri=AGENTS_DOC_URI,
+            description=(
+                "Guidance for OzmaDB (FunDB), FunQL and REST API usage based on wiki.ozma.io. "
+                "Intended as MCP-accessible reference documentation for LLM agents."
+            ),
+            mimeType="text/markdown",
+            size=size,
+        )
+    ]
+    resources.append(
+        types.Resource(
+            name="ozma_wiki_index",
+            title="Ozma Wiki Docs Index",
+            uri=WIKI_DOC_INDEX_URI,
+            description="Index of Ozma wiki documentation sections exposed via MCP resources.",
+            mimeType="text/markdown",
+        )
+    )
+    resources.append(
+        types.Resource(
+            name="ozma_wiki_full",
+            title="Ozma Wiki Full Bundle",
+            uri=WIKI_DOC_FULL_URI,
+            description="Combined text bundle of all configured Ozma wiki documentation sections.",
+            mimeType="text/markdown",
+        )
+    )
+    for slug, meta in WIKI_DOCS.items():
+        resources.append(
+            types.Resource(
+                name=f"ozma_wiki_{slug.replace('-', '_').replace('/', '_')}",
+                title=meta["title"],
+                uri=f"{WIKI_DOC_PREFIX}{slug}",
+                description=f"Wiki section mirror for {meta['title']}",
+                mimeType="text/markdown",
+            )
+        )
+    return resources
+
+
+@app.read_resource()
+async def read_resource(uri: str) -> str:
+    uri_str = str(uri)
+    if uri_str == AGENTS_DOC_URI:
+        if not AGENTS_DOC_PATH.exists():
+            raise FileNotFoundError(f"Resource file not found: {AGENTS_DOC_PATH}")
+        return _compact_doc_text(AGENTS_DOC_PATH.read_text(encoding="utf-8"), uri_str)
+    if uri_str == WIKI_DOC_INDEX_URI:
+        return _compact_doc_text(await _wiki_index_doc(), uri_str)
+    if uri_str == WIKI_DOC_FULL_URI:
+        return _compact_doc_text(await _wiki_full_doc(), uri_str)
+    if uri_str.startswith(WIKI_DOC_PREFIX):
+        slug = uri_str[len(WIKI_DOC_PREFIX):]
+        return _compact_doc_text(await _fetch_wiki_doc(slug), uri_str)
+    raise FileNotFoundError(f"Unknown resource URI: {uri}")
+
+
 @app.list_tools()
 async def list_tools() -> list[types.Tool]:
     readonly_note = " ⚠️ Disabled (OZMA_READONLY=true)." if OZMA_READONLY else ""
-    return [
+    tools = [
         types.Tool(
             name="funql_query",
             description=(
@@ -674,6 +960,7 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
     ]
+    return _compact_tool_defs(tools)
 
 
 # ---------------------------------------------------------------------------
@@ -684,11 +971,11 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
         result = await _dispatch(name, arguments)
-        return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+        return [types.TextContent(type="text", text=_json_dump(result))]
     except PermissionError as e:
-        return [types.TextContent(type="text", text=json.dumps({"error": str(e), "type": "readonly"}))]
+        return [types.TextContent(type="text", text=_json_dump({"error": str(e), "type": "readonly"}))]
     except Exception as e:
-        return [types.TextContent(type="text", text=json.dumps(_exception_payload(e), ensure_ascii=False))]
+        return [types.TextContent(type="text", text=_json_dump(_exception_payload(e)))]
 
 
 def _require_write():
