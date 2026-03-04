@@ -108,7 +108,9 @@ async def _ensure_token() -> Optional[str]:
 
 
 def _auth_headers() -> dict:
-    return {"Authorization": f"Bearer {_access_token or ''}"}
+    if not _access_token:
+        return {}
+    return {"Authorization": f"Bearer {_access_token}"}
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +378,21 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
+            name="validate_funql",
+            description=(
+                "Validate a FunQL query by resolving it through anonymous view metadata endpoint. "
+                "Optionally passes query params (JSON-encoded). Returns `ok`, HTTP status, and backend error details."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "FunQL query to validate"},
+                    "params": {"type": "object", "description": "Optional query parameters", "additionalProperties": True},
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
             name="list_schemas",
             description="List all schemas in the OzmaDB instance (queries `public.schemas`).",
             inputSchema={"type": "object", "properties": {}},
@@ -560,8 +577,62 @@ async def list_tools() -> list[types.Tool]:
                     "schema": {"type": "string", "description": "Entity schema, e.g. `base`"},
                     "entity": {"type": "string", "description": "Entity name, e.g. `contacts`"},
                     "field": {"type": "string", "description": "Field name, e.g. `desired_name`"},
+                    "schema_filter": {"type": "string", "description": "Optional result filter by schema name"},
+                    "include_views": {"type": "boolean", "description": "Include matches from `public.user_views.query`"},
+                    "include_actions": {"type": "boolean", "description": "Include matches from `public.actions.function`"},
+                    "include_triggers": {"type": "boolean", "description": "Include matches from `public.triggers.procedure`"},
+                    "include_modules": {"type": "boolean", "description": "Include matches from `admin.modules_table` JS code"},
+                    "include_metadata": {"type": "boolean", "description": "Include matches from metadata expressions/defaults/rules"},
                 },
                 "required": ["schema", "entity", "field"],
+            },
+        ),
+        types.Tool(
+            name="safe_update_view_query",
+            description=(
+                "Safely update `public.user_views.query` by replacing text in a named view query. "
+                "Supports dry-run and preflight FunQL validation before commit."
+                + readonly_note
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "View schema, e.g. `crm`"},
+                    "view_name": {"type": "string", "description": "View name"},
+                    "from_text": {"type": "string", "description": "Exact text to replace"},
+                    "to_text": {"type": "string", "description": "Replacement text"},
+                    "replace_count": {"type": "integer", "description": "Optional max replacement count", "minimum": 1},
+                    "dry_run": {"type": "boolean", "description": "If true, do not persist changes"},
+                    "validate_before_commit": {"type": "boolean", "description": "Validate resulting query before write"},
+                },
+                "required": ["schema", "view_name", "from_text", "to_text"],
+            },
+        ),
+        types.Tool(
+            name="upsert_computed_field",
+            description=(
+                "Create or update a computed field in `public.computed_fields` for a target entity. "
+                "Performs hierarchy conflict pre-check and can auto-fallback to `is_virtual=true` when needed."
+                + readonly_note
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "Entity schema, e.g. `base`"},
+                    "entity": {"type": "string", "description": "Entity name, e.g. `contacts`"},
+                    "field_name": {"type": "string", "description": "Computed field name"},
+                    "expression": {"type": "string", "description": "FunQL expression"},
+                    "is_virtual": {"type": "boolean", "description": "Computed field virtual flag (default: true)"},
+                    "is_materialized": {"type": "boolean", "description": "Materialized flag (default: false)"},
+                    "allow_broken": {"type": "boolean", "description": "Allow broken expression (default: false)"},
+                    "description": {"type": "string", "description": "Field description (default: empty string)"},
+                    "metadata": {"type": "object", "description": "Field metadata JSON (default: {})"},
+                    "auto_virtual_fallback": {
+                        "type": "boolean",
+                        "description": "If hierarchy conflict is detected and is_virtual=false, retry with is_virtual=true",
+                    },
+                },
+                "required": ["schema", "entity", "field_name", "expression"],
             },
         ),
     ]
@@ -591,6 +662,8 @@ async def _dispatch(name: str, args: dict) -> Any:
     match name:
         case "check_access":
             return await _tool_check_access()
+        case "validate_funql":
+            return await _tool_validate_funql(args["query"], args.get("params", {}))
         case "funql_query":
             return await _tool_funql_query(args["query"], args.get("params", {}), args.get("limit"), args.get("offset"))
         case "named_view_query":
@@ -634,7 +707,42 @@ async def _dispatch(name: str, args: dict) -> Any:
         case "search_in_metadata":
             return await _tool_search_in_metadata(args["text"])
         case "where_used_field":
-            return await _tool_where_used_field(args["schema"], args["entity"], args["field"])
+            return await _tool_where_used_field(
+                args["schema"],
+                args["entity"],
+                args["field"],
+                schema_filter=args.get("schema_filter"),
+                include_views=args.get("include_views", True),
+                include_actions=args.get("include_actions", True),
+                include_triggers=args.get("include_triggers", True),
+                include_modules=args.get("include_modules", True),
+                include_metadata=args.get("include_metadata", True),
+            )
+        case "safe_update_view_query":
+            _require_write()
+            return await _tool_safe_update_view_query(
+                schema=args["schema"],
+                view_name=args["view_name"],
+                from_text=args["from_text"],
+                to_text=args["to_text"],
+                replace_count=args.get("replace_count"),
+                dry_run=args.get("dry_run", False),
+                validate_before_commit=args.get("validate_before_commit", True),
+            )
+        case "upsert_computed_field":
+            _require_write()
+            return await _tool_upsert_computed_field(
+                schema=args["schema"],
+                entity=args["entity"],
+                field_name=args["field_name"],
+                expression=args["expression"],
+                is_virtual=args.get("is_virtual", True),
+                is_materialized=args.get("is_materialized", False),
+                allow_broken=args.get("allow_broken", False),
+                description=args.get("description", ""),
+                metadata=args.get("metadata", {}),
+                auto_virtual_fallback=args.get("auto_virtual_fallback", True),
+            )
         case _:
             return {"error": f"Unknown tool: {name}", "type": "not_found"}
 
@@ -646,10 +754,20 @@ async def _dispatch(name: str, args: dict) -> Any:
 async def _tool_check_access() -> dict:
     await _ensure_token()
     try:
-        r = await _get_client().get(f"{OZMA_API_BASE}check_access", headers=_auth_headers())
+        r = await _get(f"{OZMA_API_BASE}check_access")
         return {"ok": r.status_code == 200, "status": r.status_code, "readonly": OZMA_READONLY}
     except httpx.RequestError as e:
         return {"ok": False, "error": str(e), "type": "network"}
+
+
+async def _tool_validate_funql(query: str, params: dict | None = None) -> dict:
+    qp = {"__query": query.rstrip()}
+    qp.update(_json_params(params or {}))
+    r = await _get(f"{OZMA_API_BASE}views/anonymous/info", params=qp)
+    if r.status_code == 200:
+        return {"ok": True, "status": 200}
+    err = _ozma_error(r)
+    return {"ok": False, "status": r.status_code, "error": err.get("error"), "type": err.get("type")}
 
 
 def _apply_pagination(query: str, limit: Optional[int], offset: Optional[int]) -> str:
@@ -718,6 +836,7 @@ async def _tool_transaction(operations: list[dict]) -> dict:
     r = await _post(f"{OZMA_API_BASE}transaction", {"operations": operations})
     if r.status_code != 200:
         raise RuntimeError(json.dumps(_ozma_error(r)))
+    _cache.invalidate()
     return r.json()
 
 
@@ -725,6 +844,7 @@ async def _tool_run_action(schema: str, action_name: str, action_args: dict) -> 
     r = await _post(f"{OZMA_API_BASE}actions/{schema}/{action_name}/run", action_args)
     if r.status_code != 200:
         raise RuntimeError(json.dumps(_ozma_error(r)))
+    _cache.invalidate()
     return r.json()
 
 
@@ -1162,27 +1282,26 @@ def _dedupe_by_keys(rows: list[dict], keys: list[str]) -> list[dict]:
     return out
 
 
-async def _tool_where_used_field(schema: str, entity: str, field: str) -> dict:
-    patterns = _field_usage_patterns(schema, entity, field)
+def _filter_by_schema(rows: list[dict], schema_filter: Optional[str]) -> list[dict]:
+    if not schema_filter:
+        return rows
+    return [row for row in rows if row.get("schema_name") == schema_filter]
 
-    metadata_by_pattern, js_by_pattern, view_hits = await asyncio.gather(
-        asyncio.gather(*[_tool_search_in_metadata(p) for p in patterns]),
-        asyncio.gather(*[_tool_search_in_all(p) for p in patterns]),
-        asyncio.gather(
-            *[
-                _tool_funql_query(
-                    "{ $needle string }: "
-                    "select s.name as schema_name, uv.name as view_name, uv.query as query "
-                    "from public.user_views as uv "
-                    "join public.schemas as s on uv.schema_id = s.id "
-                    "where uv.query ilike $needle "
-                    "order by s.name, uv.name",
-                    {"needle": f"%{p}%"},
-                )
-                for p in patterns
-            ]
-        ),
-    )
+
+async def _tool_where_used_field(
+    schema: str,
+    entity: str,
+    field: str,
+    *,
+    schema_filter: Optional[str] = None,
+    include_views: bool = True,
+    include_actions: bool = True,
+    include_triggers: bool = True,
+    include_modules: bool = True,
+    include_metadata: bool = True,
+) -> dict:
+    patterns = _field_usage_patterns(schema, entity, field)
+    errors: list[dict] = []
 
     metadata_acc: dict[str, list[dict]] = {
         "entities_main_field": [],
@@ -1193,31 +1312,62 @@ async def _tool_where_used_field(schema: str, entity: str, field: str) -> dict:
         "user_views": [],
         "user_view_generators": [],
     }
-    for hit in metadata_by_pattern:
+    if include_metadata:
+        for p in patterns:
+            try:
+                hit = await _tool_search_in_metadata(p)
+                for key in metadata_acc:
+                    metadata_acc[key].extend(hit.get(key, []))
+            except Exception as e:
+                errors.append({"area": "metadata", "pattern": p, "error": _exception_payload(e)})
         for key in metadata_acc:
-            metadata_acc[key].extend(hit.get(key, []))
-    for key in metadata_acc:
-        metadata_acc[key] = _dedupe_by_keys(
-            metadata_acc[key],
-            ["schema_name", "entity_name", "field_name", "constraint_name", "role_name", "view_name", "generator_name"],
-        )
+            metadata_acc[key] = _dedupe_by_keys(
+                _filter_by_schema(
+                    metadata_acc[key],
+                    schema_filter,
+                ),
+                ["schema_name", "entity_name", "field_name", "constraint_name", "role_name", "view_name", "generator_name"],
+            )
 
     js_actions: list[dict] = []
     js_triggers: list[dict] = []
     js_modules: list[dict] = []
-    js_errors: list[dict] = []
-    for hit in js_by_pattern:
-        js_actions.extend(hit.get("actions", []))
-        js_triggers.extend(hit.get("triggers", []))
-        js_modules.extend(hit.get("modules", []))
-        errs = hit.get("errors", {})
-        for area, err in errs.items():
-            if err:
-                js_errors.append({"area": area, "error": err})
+    for p in patterns:
+        if include_actions:
+            try:
+                js_actions.extend(await _tool_search_in_js("actions", p))
+            except Exception as e:
+                errors.append({"area": "actions", "pattern": p, "error": _exception_payload(e)})
+        if include_triggers:
+            try:
+                js_triggers.extend(await _tool_search_in_js("triggers", p))
+            except Exception as e:
+                errors.append({"area": "triggers", "pattern": p, "error": _exception_payload(e)})
+        if include_modules:
+            try:
+                js_modules.extend(await _tool_search_in_modules(p))
+            except Exception as e:
+                errors.append({"area": "modules", "pattern": p, "error": _exception_payload(e)})
+
+    js_actions = _filter_by_schema(js_actions, schema_filter)
+    js_triggers = _filter_by_schema(js_triggers, schema_filter)
 
     user_views_rows: list[dict] = []
-    for rows in view_hits:
-        user_views_rows.extend(rows)
+    if include_views:
+        for p in patterns:
+            try:
+                rows = await _tool_funql_query(
+                    "{ $needle string, $schema_name string null }: "
+                    "select s.name as schema_name, uv.name as view_name, uv.query as query "
+                    "from public.user_views as uv "
+                    "join public.schemas as s on uv.schema_id = s.id "
+                    "where uv.query ilike $needle and ($schema_name is null or s.name = $schema_name) "
+                    "order by s.name, uv.name",
+                    {"needle": f"%{p}%", "schema_name": schema_filter},
+                )
+                user_views_rows.extend(rows)
+            except Exception as e:
+                errors.append({"area": "user_views", "pattern": p, "error": _exception_payload(e)})
     user_views_rows = _dedupe_by_keys(user_views_rows, ["schema_name", "view_name"])
 
     return {
@@ -1235,7 +1385,311 @@ async def _tool_where_used_field(schema: str, entity: str, field: str) -> dict:
         "triggers": _dedupe_by_keys(js_triggers, ["schema_name", "trigger_name", "entity_name"]),
         "modules": _dedupe_by_keys(js_modules, ["module_name"]),
         "metadata": metadata_acc,
-        "errors": js_errors,
+        "errors": errors,
+    }
+
+
+async def _tool_safe_update_view_query(
+    *,
+    schema: str,
+    view_name: str,
+    from_text: str,
+    to_text: str,
+    replace_count: Optional[int] = None,
+    dry_run: bool = False,
+    validate_before_commit: bool = True,
+) -> dict:
+    rows = await _tool_funql_query(
+        "{ $schema_name string, $view_name string }: "
+        "select uv.id, uv.query "
+        "from public.user_views as uv "
+        "join public.schemas as s on uv.schema_id = s.id "
+        "where s.name = $schema_name and uv.name = $view_name",
+        {"schema_name": schema, "view_name": view_name},
+    )
+    if not rows:
+        return {"error": f"User view '{schema}.{view_name}' not found", "type": "not_found"}
+    view_id = rows[0]["id"]
+    old_query = rows[0].get("query") or ""
+    occurrences = old_query.count(from_text)
+    if occurrences == 0:
+        return {
+            "error": "No occurrences found in view query",
+            "type": "no_match",
+            "schema": schema,
+            "view_name": view_name,
+            "from_text": from_text,
+        }
+    effective_count = replace_count if replace_count is not None else occurrences
+    new_query = old_query.replace(from_text, to_text, replace_count or -1)
+
+    validation: dict[str, Any] = {"ok": True, "skipped": not validate_before_commit}
+    if validate_before_commit:
+        validation = await _tool_validate_funql(new_query, {})
+        if not validation.get("ok", False):
+            return {
+                "error": "Replacement produced invalid FunQL query",
+                "type": "validation_failed",
+                "schema": schema,
+                "view_name": view_name,
+                "occurrences": occurrences,
+                "planned_replacements": effective_count,
+                "validation": validation,
+            }
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "schema": schema,
+            "view_name": view_name,
+            "view_id": view_id,
+            "occurrences": occurrences,
+            "planned_replacements": effective_count,
+            "validation": validation,
+        }
+
+    result = await _tool_transaction(
+        [
+            {
+                "type": "update",
+                "entity": {"schema": "public", "name": "user_views"},
+                "id": view_id,
+                "entries": {"query": new_query},
+            }
+        ]
+    )
+    return {
+        "ok": True,
+        "dry_run": False,
+        "schema": schema,
+        "view_name": view_name,
+        "view_id": view_id,
+        "occurrences": occurrences,
+        "applied_replacements": effective_count,
+        "validation": validation,
+        "transaction": result,
+    }
+
+
+async def _entity_id(schema: str, entity: str) -> Optional[int]:
+    rows = await _tool_funql_query(
+        "{ $schema_name string, $entity_name string }: "
+        "select e.id "
+        "from public.entities as e "
+        "join public.schemas as s on e.schema_id = s.id "
+        "where s.name = $schema_name and e.name = $entity_name",
+        {"schema_name": schema, "entity_name": entity},
+    )
+    if not rows:
+        return None
+    return rows[0]["id"]
+
+
+async def _computed_field_row(entity_id: int, field_name: str) -> Optional[dict]:
+    rows = await _tool_funql_query(
+        "{ $entity_id int, $field_name string }: "
+        "select id, name, expression, is_virtual, is_materialized, allow_broken, description, metadata "
+        "from public.computed_fields "
+        "where entity_id = $entity_id and name = $field_name",
+        {"entity_id": entity_id, "field_name": field_name},
+    )
+    return rows[0] if rows else None
+
+
+async def _hierarchy_field_conflicts(schema: str, entity: str, field_name: str) -> list[dict]:
+    entities = await _tool_funql_query(
+        "{ $schema_name string }: "
+        "select e.id, e.name, e.parent_id=>id as parent_id "
+        "from public.entities as e "
+        "join public.schemas as s on e.schema_id = s.id "
+        "where s.name = $schema_name",
+        {"schema_name": schema},
+    )
+    fields = await _tool_funql_query(
+        "{ $schema_name string, $field_name string }: "
+        "select e.id as entity_id, e.name as entity_name, cf.is_virtual "
+        "from public.computed_fields as cf "
+        "join public.entities as e on cf.entity_id = e.id "
+        "join public.schemas as s on e.schema_id = s.id "
+        "where s.name = $schema_name and cf.name = $field_name",
+        {"schema_name": schema, "field_name": field_name},
+    )
+    by_id = {e["id"]: e for e in entities}
+    name_to_id = {e["name"]: e["id"] for e in entities}
+    target_id = name_to_id.get(entity)
+    if not target_id:
+        return []
+
+    children: dict[int, list[int]] = {}
+    for e in entities:
+        pid = e.get("parent_id")
+        if pid is None:
+            continue
+        children.setdefault(pid, []).append(e["id"])
+
+    ancestors: set[int] = set()
+    cur = by_id[target_id].get("parent_id")
+    while cur is not None and cur not in ancestors:
+        ancestors.add(cur)
+        cur = by_id.get(cur, {}).get("parent_id")
+
+    descendants: set[int] = set()
+    stack = list(children.get(target_id, []))
+    while stack:
+        cid = stack.pop()
+        if cid in descendants:
+            continue
+        descendants.add(cid)
+        stack.extend(children.get(cid, []))
+
+    conflicts = []
+    for row in fields:
+        eid = row["entity_id"]
+        if eid == target_id:
+            continue
+        if eid in ancestors:
+            scope = "ancestor"
+        elif eid in descendants:
+            scope = "descendant"
+        else:
+            scope = "unrelated"
+        conflicts.append(
+            {
+                "scope": scope,
+                "entity_id": eid,
+                "entity_name": row.get("entity_name"),
+                "is_virtual": row.get("is_virtual"),
+            }
+        )
+    return conflicts
+
+
+async def _tool_upsert_computed_field(
+    *,
+    schema: str,
+    entity: str,
+    field_name: str,
+    expression: str,
+    is_virtual: bool = True,
+    is_materialized: bool = False,
+    allow_broken: bool = False,
+    description: str = "",
+    metadata: Optional[dict] = None,
+    auto_virtual_fallback: bool = True,
+) -> dict:
+    metadata = metadata or {}
+    entity_id = await _entity_id(schema, entity)
+    if entity_id is None:
+        return {"error": f"Entity '{schema}.{entity}' not found", "type": "not_found"}
+
+    existing = await _computed_field_row(entity_id, field_name)
+    conflicts = await _hierarchy_field_conflicts(schema, entity, field_name)
+    hierarchy_conflicts = [c for c in conflicts if c["scope"] in ("ancestor", "descendant")]
+
+    effective_is_virtual = is_virtual
+    fallback_reason = None
+    if hierarchy_conflicts and not is_virtual and auto_virtual_fallback:
+        effective_is_virtual = True
+        fallback_reason = "Hierarchy has same-name computed field in ancestor/descendant; switched to is_virtual=true"
+
+    entries = {
+        "name": field_name,
+        "expression": expression,
+        "is_virtual": effective_is_virtual,
+        "is_materialized": is_materialized,
+        "allow_broken": allow_broken,
+        "description": description,
+        "metadata": metadata,
+        "entity_id": entity_id,
+    }
+
+    try:
+        if existing:
+            tx = await _tool_transaction(
+                [
+                    {
+                        "type": "update",
+                        "entity": {"schema": "public", "name": "computed_fields"},
+                        "id": existing["id"],
+                        "entries": {
+                            "expression": expression,
+                            "is_virtual": effective_is_virtual,
+                            "is_materialized": is_materialized,
+                            "allow_broken": allow_broken,
+                            "description": description,
+                            "metadata": metadata,
+                        },
+                    }
+                ]
+            )
+            op = "update"
+            result_id = existing["id"]
+        else:
+            tx = await _tool_transaction(
+                [
+                    {
+                        "type": "insert",
+                        "entity": {"schema": "public", "name": "computed_fields"},
+                        "entries": entries,
+                    }
+                ]
+            )
+            op = "insert"
+            result_id = tx.get("results", [{}])[0].get("id")
+    except Exception as e:
+        payload = _exception_payload(e)
+        if auto_virtual_fallback and not effective_is_virtual and "Computed field names clash" in (payload.get("error") or ""):
+            if existing:
+                tx = await _tool_transaction(
+                    [
+                        {
+                            "type": "update",
+                            "entity": {"schema": "public", "name": "computed_fields"},
+                            "id": existing["id"],
+                            "entries": {
+                                "expression": expression,
+                                "is_virtual": True,
+                                "is_materialized": is_materialized,
+                                "allow_broken": allow_broken,
+                                "description": description,
+                                "metadata": metadata,
+                            },
+                        }
+                    ]
+                )
+                op = "update"
+                result_id = existing["id"]
+            else:
+                entries["is_virtual"] = True
+                tx = await _tool_transaction(
+                    [
+                        {
+                            "type": "insert",
+                            "entity": {"schema": "public", "name": "computed_fields"},
+                            "entries": entries,
+                        }
+                    ]
+                )
+                op = "insert"
+                result_id = tx.get("results", [{}])[0].get("id")
+            fallback_reason = "Retry succeeded with is_virtual=true after clash error"
+            effective_is_virtual = True
+        else:
+            raise
+
+    return {
+        "ok": True,
+        "operation": op,
+        "schema": schema,
+        "entity": entity,
+        "field_name": field_name,
+        "field_id": result_id,
+        "requested_is_virtual": is_virtual,
+        "effective_is_virtual": effective_is_virtual,
+        "hierarchy_conflicts": hierarchy_conflicts,
+        "fallback_reason": fallback_reason,
+        "transaction": tx,
     }
 
 

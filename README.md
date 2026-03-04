@@ -7,6 +7,7 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | Tool | Описание |
 |------|----------|
 | `check_access` | Проверить доступность инстанса и валидность токена |
+| `validate_funql` | Preflight-проверка FunQL (resolve/валидация без записи) |
 | `funql_query` | Выполнить произвольный FunQL SELECT запрос |
 | `named_view_query` | Получить данные из именованного user view |
 | `named_view_info` | Получить метаданные (колонки, типы) именованного view |
@@ -18,6 +19,8 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `list_entity_fields` | Список полей сущности (column + computed) |
 | `search_in_metadata` | Поиск подстроки в метаданных схемы (expressions/defaults/role rules/views) |
 | `where_used_field` | Точечный поиск использования поля по `schema/entity/field` в views/actions/triggers/metadata |
+| `safe_update_view_query` | Безопасный replace в `public.user_views.query` с dry-run и валидацией |
+| `upsert_computed_field` | Создание/обновление computed field с pre-check конфликтов в наследовании |
 
 ## Установка
 
@@ -102,6 +105,13 @@ mcp_servers:
 
 Важно: в FunQL не поддерживается `SELECT *`. Нужно перечислять колонки явно.
 
+### Валидация FunQL перед сохранением
+```
+Используй validate_funql:
+  query: "select id, name from base.contacts where id = $id"
+  params: {id: 1}
+```
+
 ### Вставка записи
 ```
 Используй transaction:
@@ -137,3 +147,33 @@ mcp_servers:
   action_name: send_invoice
   args: {order_id: 101}
 ```
+
+### Безопасная правка user view query
+```
+Используй safe_update_view_query:
+  schema: crm
+  view_name: announced_classes_table
+  from_text: "contact=>desired_name"
+  to_text: "contact=>desired_full_name"
+  dry_run: true
+```
+
+### Upsert computed field
+```
+Используй upsert_computed_field:
+  schema: base
+  entity: contacts
+  field_name: desired_full_name
+  expression: "''"
+  is_virtual: true
+```
+
+## Накопленные знания (Ozma schema specifics)
+
+- Для computed field с одинаковым именем в родителе и потомке:
+  - если поле в потомке `is_virtual = false`, Ozma может вернуть конфликт имён;
+  - если поле в потомке `is_virtual = true`, одноимённые поля в `contacts` и `people` допускаются.
+- Проверенный кейс `desired_full_name`:
+  - `base.contacts.desired_full_name` можно держать как `expression = ''`, `is_virtual = true`;
+  - `base.people.desired_full_name` можно переопределять своей формулой при `is_virtual = true`.
+- При правках `public.user_views.query` Ozma валидирует выражения сразу: ссылка на несуществующее поле (например, `contact=>desired_full_name` при отсутствии поля у `base.contacts`) отклоняет миграцию.
