@@ -152,6 +152,27 @@ def _ozma_error(r: httpx.Response) -> dict:
         return {"error": r.text, "status": r.status_code, "type": "generic"}
 
 
+def _augment_funql_error(err: dict, query: str) -> dict:
+    """
+    Attach targeted hints for common metadata-query pitfalls.
+    """
+    query_l = (query or "").lower()
+    message = str(err.get("error", ""))
+    message_l = message.lower()
+    if (
+        "public.user_views" in query_l
+        and "unknown field" in message_l
+        and ('"schema"' in message or ".schema" in message_l)
+    ):
+        err = dict(err)
+        err["hint"] = (
+            "In `public.user_views`, schema is stored as `schema_id` (reference to `public.schemas`). "
+            "Use `join public.schemas as s on uv.schema_id = s.id` and filter by `s.name`, "
+            "or filter by `uv.full_name = 'schema.view_name'`."
+        )
+    return err
+
+
 def _exception_payload(e: Exception) -> dict:
     """Unwrap nested JSON errors raised from tool helpers."""
     msg = str(e)
@@ -315,6 +336,23 @@ async def list_tools() -> list[types.Tool]:
                     "schema_name": {"type": "string", "description": "Optional schema filter, e.g. `usr`"},
                     "view_name_like": {"type": "string", "description": "Optional case-insensitive substring for view names"},
                 },
+            },
+        ),
+        types.Tool(
+            name="get_user_view_query",
+            description=(
+                "Get raw FunQL query text for a named user view from `public.user_views`. "
+                "Useful for debugging and explaining metric discrepancies."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "View schema, e.g. `crm`"},
+                    "view_name": {"type": "string", "description": "View name"},
+                    "limit": {"type": "integer", "description": "Max rows to return", "minimum": 1},
+                    "offset": {"type": "integer", "description": "Skip first N rows", "minimum": 0},
+                },
+                "required": ["schema", "view_name"],
             },
         ),
         types.Tool(
@@ -672,6 +710,8 @@ async def _dispatch(name: str, args: dict) -> Any:
             return await _tool_named_view_info(args["schema"], args["view_name"])
         case "list_user_views":
             return await _tool_list_user_views(args.get("schema_name"), args.get("view_name_like"))
+        case "get_user_view_query":
+            return await _tool_get_user_view_query(args["schema"], args["view_name"], args.get("limit"), args.get("offset"))
         case "transaction":
             _require_write()
             return await _tool_transaction(args["operations"])
@@ -789,7 +829,7 @@ async def _tool_funql_query(query: str, params: dict, limit: Optional[int] = Non
     qp.update(_json_params(params))
     r = await _get(f"{OZMA_API_BASE}views/anonymous/entries", params=qp)
     if r.status_code != 200:
-        raise RuntimeError(json.dumps(_ozma_error(r)))
+        raise RuntimeError(json.dumps(_augment_funql_error(_ozma_error(r), query)))
     return _parse_rows(r.json())
 
 
@@ -830,6 +870,27 @@ async def _tool_list_user_views(schema_name: Optional[str] = None, view_name_lik
         "order by s.name, uv.name"
     )
     return await _tool_funql_query(query, {})
+
+
+async def _tool_get_user_view_query(
+    schema: str,
+    view_name: str,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> dict:
+    rows = await _tool_funql_query(
+        "{ $schema_name string, $view_name string }: "
+        "select uv.id, s.name as schema_name, uv.name as view_name, uv.full_name, uv.query "
+        "from public.user_views as uv "
+        "join public.schemas as s on uv.schema_id = s.id "
+        "where s.name = $schema_name and uv.name = $view_name",
+        {"schema_name": schema, "view_name": view_name},
+        limit,
+        offset,
+    )
+    if not rows:
+        return {"error": f"User view '{schema}.{view_name}' not found", "type": "not_found"}
+    return rows[0]
 
 
 async def _tool_transaction(operations: list[dict]) -> dict:

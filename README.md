@@ -12,6 +12,7 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `named_view_query` | Получить данные из именованного user view |
 | `named_view_info` | Получить метаданные (колонки, типы) именованного view |
 | `list_user_views` | Показать доступные именованные user view (для диагностики 404) |
+| `get_user_view_query` | Получить исходный FunQL-текст именованного user view (`limit`/`offset` поддерживаются) |
 | `transaction` | Выполнить атомарную транзакцию (insert / update / delete) |
 | `run_action` | Запустить серверный action |
 | `list_schemas` | Список схем в базе |
