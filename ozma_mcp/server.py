@@ -215,6 +215,28 @@ def _augment_funql_error(err: dict, query: str) -> dict:
             "Use `join public.schemas as s on uv.schema_id = s.id` and filter by `s.name`, "
             "or filter by `uv.full_name = 'schema.view_name'`."
         )
+    if "public.triggers" in query_l and "unknown field" in message_l:
+        err = dict(err)
+        err["hint"] = (
+            "In `public.triggers`, names like `schema_name/entity_name/trigger_name` are not physical fields. "
+            "Use `t.name as trigger_name` and joins: "
+            "`join public.schemas s on t.schema_id = s.id`, "
+            "`join public.entities e on t.trigger_entity_id = e.id`."
+        )
+    if "public.actions" in query_l and "unknown field" in message_l:
+        err = dict(err)
+        err["hint"] = (
+            "In `public.actions`, use `a.name as action_name` and "
+            "`join public.schemas s on a.schema_id = s.id` for schema name."
+        )
+    if "unknown field" in message_l and ("&admin." in query_l or "from admin." in query_l):
+        err = dict(err)
+        err["hint"] = (
+            "Unknown field in admin view/entity query. First fetch allowed columns via "
+            "`list_view_columns(schema='admin', view_name='...')` (for user views) or "
+            "`list_entity_fields(schema_name='admin', entity_name='...')` (for entities), "
+            "then use only returned field names."
+        )
     return err
 
 
@@ -341,8 +363,9 @@ def _compact_tool_defs(tools: list[types.Tool]) -> list[types.Tool]:
     return compact
 
 
-def _json_dump(data: Any) -> str:
-    if OZMA_TRIM_LONG_FIELDS:
+def _json_dump(data: Any, *, trim_override: Optional[bool] = None) -> str:
+    should_trim = OZMA_TRIM_LONG_FIELDS if trim_override is None else trim_override
+    if should_trim:
         data = _compact_value(data)
     if OZMA_COMPACT_JSON:
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -611,6 +634,21 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="list_view_columns",
+            description=(
+                "List actual output columns of a named user view (name/type/attributes). "
+                "Use this before querying admin views to avoid Unknown field errors."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "View schema, e.g. `admin`"},
+                    "view_name": {"type": "string", "description": "View name, e.g. `user_views`"},
+                },
+                "required": ["schema", "view_name"],
+            },
+        ),
+        types.Tool(
             name="list_user_views",
             description=(
                 "List named user views from `public.user_views` with optional filters by schema and view name substring. "
@@ -635,10 +673,11 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "schema": {"type": "string", "description": "View schema, e.g. `crm`"},
                     "view_name": {"type": "string", "description": "View name"},
+                    "view_id": {"type": "integer", "description": "Optional direct user_view id (alternative to schema+view_name)"},
+                    "full": {"type": "boolean", "description": "If true, disable response truncation for this call"},
                     "limit": {"type": "integer", "description": "Max rows to return", "minimum": 1},
                     "offset": {"type": "integer", "description": "Skip first N rows", "minimum": 0},
                 },
-                "required": ["schema", "view_name"],
             },
         ),
         types.Tool(
@@ -731,6 +770,33 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="list_actions",
+            description="List actions with ids and schema names (safe helper for selecting action targets).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema_name": {"type": "string", "description": "Optional schema filter"},
+                    "action_name_like": {"type": "string", "description": "Optional case-insensitive name substring"},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "offset": {"type": "integer", "minimum": 0},
+                },
+            },
+        ),
+        types.Tool(
+            name="list_triggers",
+            description="List triggers with ids, schema and entity names (safe helper for selecting trigger targets).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema_name": {"type": "string", "description": "Optional schema filter"},
+                    "entity_name": {"type": "string", "description": "Optional entity filter"},
+                    "trigger_name_like": {"type": "string", "description": "Optional case-insensitive name substring"},
+                    "limit": {"type": "integer", "minimum": 1},
+                    "offset": {"type": "integer", "minimum": 0},
+                },
+            },
+        ),
+        types.Tool(
             name="list_entity_fields",
             description="List column and computed fields of a specific entity.",
             inputSchema={
@@ -765,8 +831,9 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "schema": {"type": "string"},
                     "action_name": {"type": "string"},
+                    "action_id": {"type": "integer", "description": "Optional direct action id (alternative to schema+action_name)"},
+                    "full": {"type": "boolean", "description": "If true, disable response truncation for this call"},
                 },
-                "required": ["schema", "action_name"],
             },
         ),
         types.Tool(
@@ -777,8 +844,9 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "schema": {"type": "string"},
                     "trigger_name": {"type": "string"},
+                    "trigger_id": {"type": "integer", "description": "Optional direct trigger id (alternative to schema+trigger_name)"},
+                    "full": {"type": "boolean", "description": "If true, disable response truncation for this call"},
                 },
-                "required": ["schema", "trigger_name"],
             },
         ),
         types.Tool(
@@ -969,13 +1037,16 @@ async def list_tools() -> list[types.Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    args = arguments or {}
+    full_allowed = {"get_action_code", "get_trigger_code", "get_user_view_query"}
+    trim_override = False if (name in full_allowed and bool(args.get("full"))) else None
     try:
-        result = await _dispatch(name, arguments)
-        return [types.TextContent(type="text", text=_json_dump(result))]
+        result = await _dispatch(name, args)
+        return [types.TextContent(type="text", text=_json_dump(result, trim_override=trim_override))]
     except PermissionError as e:
-        return [types.TextContent(type="text", text=_json_dump({"error": str(e), "type": "readonly"}))]
+        return [types.TextContent(type="text", text=_json_dump({"error": str(e), "type": "readonly"}, trim_override=trim_override))]
     except Exception as e:
-        return [types.TextContent(type="text", text=_json_dump(_exception_payload(e)))]
+        return [types.TextContent(type="text", text=_json_dump(_exception_payload(e), trim_override=trim_override))]
 
 
 def _require_write():
@@ -995,10 +1066,18 @@ async def _dispatch(name: str, args: dict) -> Any:
             return await _tool_named_view_query(args["schema"], args["view_name"], args.get("params", {}), args.get("limit"), args.get("offset"))
         case "named_view_info":
             return await _tool_named_view_info(args["schema"], args["view_name"])
+        case "list_view_columns":
+            return await _tool_list_view_columns(args["schema"], args["view_name"])
         case "list_user_views":
             return await _tool_list_user_views(args.get("schema_name"), args.get("view_name_like"))
         case "get_user_view_query":
-            return await _tool_get_user_view_query(args["schema"], args["view_name"], args.get("limit"), args.get("offset"))
+            return await _tool_get_user_view_query(
+                schema=args.get("schema"),
+                view_name=args.get("view_name"),
+                view_id=args.get("view_id"),
+                limit=args.get("limit"),
+                offset=args.get("offset"),
+            )
         case "transaction":
             _require_write()
             return await _tool_transaction(args["operations"])
@@ -1009,14 +1088,37 @@ async def _dispatch(name: str, args: dict) -> Any:
             return await _tool_list_schemas()
         case "list_entities":
             return await _tool_list_entities(args["schema_name"])
+        case "list_actions":
+            return await _tool_list_actions(
+                schema_name=args.get("schema_name"),
+                action_name_like=args.get("action_name_like"),
+                limit=args.get("limit"),
+                offset=args.get("offset"),
+            )
+        case "list_triggers":
+            return await _tool_list_triggers(
+                schema_name=args.get("schema_name"),
+                entity_name=args.get("entity_name"),
+                trigger_name_like=args.get("trigger_name_like"),
+                limit=args.get("limit"),
+                offset=args.get("offset"),
+            )
         case "list_entity_fields":
             return await _tool_list_entity_fields(args["schema_name"], args["entity_name"])
         case "search_field":
             return await _tool_search_field(args["field_name"])
         case "get_action_code":
-            return await _tool_get_action_code(args["schema"], args["action_name"])
+            return await _tool_get_action_code(
+                schema=args.get("schema"),
+                action_name=args.get("action_name"),
+                action_id=args.get("action_id"),
+            )
         case "get_trigger_code":
-            return await _tool_get_trigger_code(args["schema"], args["trigger_name"])
+            return await _tool_get_trigger_code(
+                schema=args.get("schema"),
+                trigger_name=args.get("trigger_name"),
+                trigger_id=args.get("trigger_id"),
+            )
         case "search_in_modules":
             return await _tool_search_in_modules(args["text"])
         case "get_module_code":
@@ -1140,6 +1242,40 @@ async def _tool_named_view_info(schema: str, view_name: str) -> dict:
     return r.json()
 
 
+def _pick_value_type(column: dict) -> Any:
+    if "cell" in column and isinstance(column["cell"], dict) and "valueType" in column["cell"]:
+        return column["cell"].get("valueType")
+    if "valueType" in column:
+        return column.get("valueType")
+    return None
+
+
+async def _tool_list_view_columns(schema: str, view_name: str) -> dict:
+    raw = await _tool_named_view_info(schema, view_name)
+    info = raw.get("info") if isinstance(raw, dict) and isinstance(raw.get("info"), dict) else raw
+    columns = []
+    for col in (info.get("columns") or []):
+        attributes = col.get("attributes") or {}
+        columns.append(
+            {
+                "name": col.get("name"),
+                "value_type": _pick_value_type(col),
+                "has_attributes": bool(attributes),
+                "attribute_keys": sorted(attributes.keys())[:30] if isinstance(attributes, dict) else [],
+            }
+        )
+    return {
+        "schema": schema,
+        "view_name": view_name,
+        "columns_count": len(columns),
+        "columns": columns,
+        "usage_hint": (
+            "Use only names from `columns[].name` in follow-up queries/logic for this view. "
+            "Do not assume SQL-like aliases such as schema_name/entity_name unless present in this list."
+        ),
+    }
+
+
 async def _tool_list_user_views(schema_name: Optional[str] = None, view_name_like: Optional[str] = None) -> list[dict]:
     conditions = []
     if schema_name:
@@ -1160,11 +1296,32 @@ async def _tool_list_user_views(schema_name: Optional[str] = None, view_name_lik
 
 
 async def _tool_get_user_view_query(
-    schema: str,
-    view_name: str,
+    schema: Optional[str] = None,
+    view_name: Optional[str] = None,
+    view_id: Optional[int] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
 ) -> dict:
+    if view_id is not None:
+        rows = await _tool_funql_query(
+            "{ $view_id int }: "
+            "select uv.id, s.name as schema_name, uv.name as view_name, uv.full_name, uv.query "
+            "from public.user_views as uv "
+            "join public.schemas as s on uv.schema_id = s.id "
+            "where uv.id = $view_id",
+            {"view_id": view_id},
+            limit,
+            offset,
+        )
+        if not rows:
+            return {"error": f"User view id={view_id} not found", "type": "not_found"}
+        return rows[0]
+    if not schema or not view_name:
+        return {
+            "error": "Provide either `view_id` or both `schema` and `view_name`.",
+            "type": "validation",
+            "example": {"schema": "crm", "view_name": "orders_table"},
+        }
     rows = await _tool_funql_query(
         "{ $schema_name string, $view_name string }: "
         "select uv.id, s.name as schema_name, uv.name as view_name, uv.full_name, uv.query "
@@ -1224,6 +1381,54 @@ async def _tool_list_entities(schema_name: str) -> list[dict]:
     )
 
 
+async def _tool_list_actions(
+    schema_name: Optional[str] = None,
+    action_name_like: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> list[dict]:
+    conditions = []
+    params: dict[str, Any] = {"schema_name": schema_name, "action_name_like": f"%{action_name_like}%" if action_name_like else None}
+    conditions.append("($schema_name is null or s.name = $schema_name)")
+    conditions.append("($action_name_like is null or a.name ilike $action_name_like)")
+    query = (
+        "{ $schema_name string null, $action_name_like string null }: "
+        "select a.id, s.name as schema_name, a.name as action_name "
+        "from public.actions as a "
+        "join public.schemas as s on a.schema_id = s.id "
+        f"where {' and '.join(conditions)} "
+        "order by s.name, a.name"
+    )
+    return await _tool_funql_query(query, params, limit=limit, offset=offset)
+
+
+async def _tool_list_triggers(
+    schema_name: Optional[str] = None,
+    entity_name: Optional[str] = None,
+    trigger_name_like: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> list[dict]:
+    params: dict[str, Any] = {
+        "schema_name": schema_name,
+        "entity_name": entity_name,
+        "trigger_name_like": f"%{trigger_name_like}%" if trigger_name_like else None,
+    }
+    query = (
+        "{ $schema_name string null, $entity_name string null, $trigger_name_like string null }: "
+        "select t.id, s.name as schema_name, e.name as entity_name, t.name as trigger_name "
+        "from public.triggers as t "
+        "join public.schemas as s on t.schema_id = s.id "
+        "join public.entities as e on t.trigger_entity_id = e.id "
+        "where "
+        "($schema_name is null or s.name = $schema_name) and "
+        "($entity_name is null or e.name = $entity_name) and "
+        "($trigger_name_like is null or t.name ilike $trigger_name_like) "
+        "order by s.name, t.name"
+    )
+    return await _tool_funql_query(query, params, limit=limit, offset=offset)
+
+
 async def _tool_list_entity_fields(schema_name: str, entity_name: str) -> dict:
     cache_key = f"fields:{schema_name}.{entity_name}"
     hit = _cache.get(cache_key)
@@ -1278,28 +1483,76 @@ async def _tool_search_field(field_name: str) -> list[dict]:
     return (columns or []) + (computed or [])
 
 
-async def _tool_get_action_code(schema: str, action_name: str) -> dict:
+async def _tool_get_action_code(
+    schema: Optional[str] = None,
+    action_name: Optional[str] = None,
+    action_id: Optional[int] = None,
+) -> dict:
+    if action_id is not None:
+        rows = await _tool_funql_query(
+            "{ $action_id int }: "
+            "select a.id, a.name as action_name, s.name as schema_name, a.function as code "
+            "from public.actions as a "
+            "join public.schemas as s on a.schema_id = s.id "
+            "where a.id = $action_id",
+            {"action_id": action_id},
+        )
+        if not rows:
+            return {"error": f"Action id={action_id} not found", "type": "not_found"}
+        return rows[0]
+    if not schema or not action_name:
+        return {
+            "error": "Provide either `action_id` or both `schema` and `action_name`.",
+            "type": "validation",
+            "example": {"schema": "usr", "action_name": "send_invoice"},
+        }
     rows = await _tool_funql_query(
-        f"select a.name as action_name, s.name as schema_name, a.function as code "
-        f"from public.actions as a "
-        f"join public.schemas as s on a.schema_id = s.id "
-        f"where s.name = '{schema}' and a.name = '{action_name}'",
-        {},
+        "{ $schema_name string, $action_name string }: "
+        "select a.id, a.name as action_name, s.name as schema_name, a.function as code "
+        "from public.actions as a "
+        "join public.schemas as s on a.schema_id = s.id "
+        "where s.name = $schema_name and a.name = $action_name",
+        {"schema_name": schema, "action_name": action_name},
     )
     if not rows:
         return {"error": f"Action '{schema}.{action_name}' not found", "type": "not_found"}
     return rows[0]
 
 
-async def _tool_get_trigger_code(schema: str, trigger_name: str) -> dict:
+async def _tool_get_trigger_code(
+    schema: Optional[str] = None,
+    trigger_name: Optional[str] = None,
+    trigger_id: Optional[int] = None,
+) -> dict:
+    if trigger_id is not None:
+        rows = await _tool_funql_query(
+            "{ $trigger_id int }: "
+            "select t.id, t.name as trigger_name, s.name as schema_name, "
+            "e.name as entity_name, t.procedure as code "
+            "from public.triggers as t "
+            "join public.schemas as s on t.schema_id = s.id "
+            "join public.entities as e on t.trigger_entity_id = e.id "
+            "where t.id = $trigger_id",
+            {"trigger_id": trigger_id},
+        )
+        if not rows:
+            return {"error": f"Trigger id={trigger_id} not found", "type": "not_found"}
+        return rows[0]
+    if not schema or not trigger_name:
+        return {
+            "error": "Provide either `trigger_id` or both `schema` and `trigger_name`.",
+            "type": "validation",
+            "example": {"schema": "usr", "trigger_name": "orders_before_insert"},
+        }
     rows = await _tool_funql_query(
-        f"select t.name as trigger_name, s.name as schema_name, "
-        f"e.name as entity_name, t.procedure as code "
-        f"from public.triggers as t "
-        f"join public.schemas as s on t.schema_id = s.id "
-        f"join public.entities as e on t.trigger_entity_id = e.id "
-        f"where s.name = '{schema}' and t.name = '{trigger_name}'",
-        {},
+        "{ $schema_name string, $trigger_name string }: "
+        "select t.id, t.name as trigger_name, s.name as schema_name, "
+        "e.name as entity_name, t.procedure as code "
+        "from public.triggers as t "
+        "join public.schemas as s on t.schema_id = s.id "
+        "join public.entities as e on t.trigger_entity_id = e.id "
+        "where s.name = $schema_name and t.name = $trigger_name",
+        {"schema_name": schema, "trigger_name": trigger_name},
     )
     if not rows:
         return {"error": f"Trigger '{schema}.{trigger_name}' not found", "type": "not_found"}

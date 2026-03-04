@@ -15,12 +15,15 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `funql_query` | Выполнить произвольный FunQL SELECT запрос |
 | `named_view_query` | Получить данные из именованного user view |
 | `named_view_info` | Получить метаданные (колонки, типы) именованного view |
+| `list_view_columns` | Получить фактический список колонок user view (рекомендуется перед запросами к `admin.*`) |
 | `list_user_views` | Показать доступные именованные user view (для диагностики 404) |
 | `get_user_view_query` | Получить исходный FunQL-текст именованного user view (`limit`/`offset` поддерживаются) |
 | `transaction` | Выполнить атомарную транзакцию (insert / update / delete) |
 | `run_action` | Запустить серверный action |
 | `list_schemas` | Список схем в базе |
 | `list_entities` | Список сущностей (таблиц) в схеме |
+| `list_actions` | Список actions с `id/schema_name/action_name` |
+| `list_triggers` | Список triggers с `id/schema_name/entity_name/trigger_name` |
 | `list_entity_fields` | Список полей сущности (column + computed) |
 | `search_in_metadata` | Поиск подстроки в метаданных схемы (expressions/defaults/role rules/views) |
 | `where_used_field` | Точечный поиск использования поля по `schema/entity/field` в views/actions/triggers/metadata |
@@ -197,6 +200,35 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
   schema: usr
   action_name: send_invoice
   args: {order_id: 101}
+```
+
+### Получить полный код action/trigger/view (без обрезки)
+```
+Используй get_action_code:
+  schema: usr
+  action_name: send_invoice
+  full: true
+```
+
+### Избежать ошибок по полям в `admin` user views
+```
+Используй list_view_columns:
+  schema: admin
+  view_name: user_views
+```
+
+Затем в последующих запросах используй только имена из `columns[].name`.
+
+```
+Используй get_trigger_code:
+  trigger_id: 123
+  full: true
+```
+
+```
+Используй get_user_view_query:
+  view_id: 456
+  full: true
 ```
 
 ### Безопасная правка user view query
