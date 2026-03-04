@@ -830,6 +830,23 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="analyze_action_performance",
+            description=(
+                "Analyze OzmaDB action JS performance risks and optimization opportunities. "
+                "Loads action code and returns prioritized findings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string"},
+                    "action_name": {"type": "string"},
+                    "action_id": {"type": "integer"},
+                    "include_snippets": {"type": "boolean", "description": "Include short code excerpts in findings (default: true)"},
+                    "max_findings": {"type": "integer", "description": "Max findings to return (default: 20)", "minimum": 1, "maximum": 100},
+                },
+            },
+        ),
+        types.Tool(
             name="get_trigger_code",
             description="Get the full JavaScript source code of a specific OzmaDB trigger.",
             inputSchema={
@@ -839,6 +856,23 @@ async def list_tools() -> list[types.Tool]:
                     "trigger_name": {"type": "string"},
                     "trigger_id": {"type": "integer", "description": "Optional direct trigger id (alternative to schema+trigger_name)"},
                     "full": {"type": "boolean", "description": "If true, disable response truncation for this call"},
+                },
+            },
+        ),
+        types.Tool(
+            name="analyze_trigger_performance",
+            description=(
+                "Analyze OzmaDB trigger JS performance risks and optimization opportunities. "
+                "Loads trigger code and returns prioritized findings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string"},
+                    "trigger_name": {"type": "string"},
+                    "trigger_id": {"type": "integer"},
+                    "include_snippets": {"type": "boolean", "description": "Include short code excerpts in findings (default: true)"},
+                    "max_findings": {"type": "integer", "description": "Max findings to return (default: 20)", "minimum": 1, "maximum": 100},
                 },
             },
         ),
@@ -1193,11 +1227,27 @@ async def _dispatch(name: str, args: dict) -> Any:
                 action_name=args.get("action_name"),
                 action_id=args.get("action_id"),
             )
+        case "analyze_action_performance":
+            return await _tool_analyze_action_performance(
+                schema=args.get("schema"),
+                action_name=args.get("action_name"),
+                action_id=args.get("action_id"),
+                include_snippets=args.get("include_snippets", True),
+                max_findings=args.get("max_findings", 20),
+            )
         case "get_trigger_code":
             return await _tool_get_trigger_code(
                 schema=args.get("schema"),
                 trigger_name=args.get("trigger_name"),
                 trigger_id=args.get("trigger_id"),
+            )
+        case "analyze_trigger_performance":
+            return await _tool_analyze_trigger_performance(
+                schema=args.get("schema"),
+                trigger_name=args.get("trigger_name"),
+                trigger_id=args.get("trigger_id"),
+                include_snippets=args.get("include_snippets", True),
+                max_findings=args.get("max_findings", 20),
             )
         case "search_in_modules":
             return await _tool_search_in_modules(args["text"])
@@ -1963,6 +2013,76 @@ async def _tool_analyze_module_performance(
             {"kind": "truncated", "severity": "low", "title": "Findings truncated", "detail": f"Returned first {max_findings} findings."}
         ]
     analysis["module"] = {"id": module.get("id"), "name": module.get("name")}
+    analysis["ok"] = True
+    return analysis
+
+
+async def _tool_analyze_action_performance(
+    schema: Optional[str] = None,
+    action_name: Optional[str] = None,
+    action_id: Optional[int] = None,
+    include_snippets: bool = True,
+    max_findings: int = 20,
+) -> dict:
+    action = await _tool_get_action_code(schema=schema, action_name=action_name, action_id=action_id)
+    if "error" in action:
+        return action
+    code = action.get("code") or ""
+    if not isinstance(code, str) or not code.strip():
+        return {
+            "error": "Action code is empty or unavailable",
+            "type": "no_code",
+            "action": {"id": action.get("id"), "schema_name": action.get("schema_name"), "action_name": action.get("action_name")},
+        }
+    analysis = _analyze_js_performance(code, include_snippets=include_snippets)
+    findings = analysis.get("findings", [])
+    if len(findings) > max_findings:
+        analysis["findings"] = findings[:max_findings] + [
+            {"kind": "truncated", "severity": "low", "title": "Findings truncated", "detail": f"Returned first {max_findings} findings."}
+        ]
+    analysis["action"] = {
+        "id": action.get("id"),
+        "schema_name": action.get("schema_name"),
+        "action_name": action.get("action_name"),
+    }
+    analysis["ok"] = True
+    return analysis
+
+
+async def _tool_analyze_trigger_performance(
+    schema: Optional[str] = None,
+    trigger_name: Optional[str] = None,
+    trigger_id: Optional[int] = None,
+    include_snippets: bool = True,
+    max_findings: int = 20,
+) -> dict:
+    trigger = await _tool_get_trigger_code(schema=schema, trigger_name=trigger_name, trigger_id=trigger_id)
+    if "error" in trigger:
+        return trigger
+    code = trigger.get("code") or ""
+    if not isinstance(code, str) or not code.strip():
+        return {
+            "error": "Trigger code is empty or unavailable",
+            "type": "no_code",
+            "trigger": {
+                "id": trigger.get("id"),
+                "schema_name": trigger.get("schema_name"),
+                "entity_name": trigger.get("entity_name"),
+                "trigger_name": trigger.get("trigger_name"),
+            },
+        }
+    analysis = _analyze_js_performance(code, include_snippets=include_snippets)
+    findings = analysis.get("findings", [])
+    if len(findings) > max_findings:
+        analysis["findings"] = findings[:max_findings] + [
+            {"kind": "truncated", "severity": "low", "title": "Findings truncated", "detail": f"Returned first {max_findings} findings."}
+        ]
+    analysis["trigger"] = {
+        "id": trigger.get("id"),
+        "schema_name": trigger.get("schema_name"),
+        "entity_name": trigger.get("entity_name"),
+        "trigger_name": trigger.get("trigger_name"),
+    }
     analysis["ok"] = True
     return analysis
 

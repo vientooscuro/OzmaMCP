@@ -30,6 +30,8 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `safe_update_view_query` | Безопасный replace в `public.user_views.query` с dry-run и валидацией |
 | `upsert_computed_field` | Создание/обновление computed field с pre-check конфликтов в наследовании |
 | `analyze_module_performance` | Авто-анализ производительности JS-модуля из `admin.modules_table` |
+| `analyze_action_performance` | Авто-анализ производительности OzmaDB action |
+| `analyze_trigger_performance` | Авто-анализ производительности OzmaDB trigger |
 
 Примечание по модулям: module-tools (`list_modules`, `search_in_modules`, `get_module_code`) читают модули из user view `admin.modules_table` (`/views/by_name/admin/modules_table`), с fallback на entity-путь для старых схем.
 
@@ -256,6 +258,24 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
 ```
 Используй analyze_module_performance:
   module_name: pl_report.mjs
+  include_snippets: true
+  max_findings: 20
+```
+
+### Проанализировать action на производительность
+```
+Используй analyze_action_performance:
+  schema: usr
+  action_name: send_invoice
+  include_snippets: true
+  max_findings: 20
+```
+
+### Проанализировать trigger на производительность
+```
+Используй analyze_trigger_performance:
+  schema: usr
+  trigger_name: orders_before_insert
   include_snippets: true
   max_findings: 20
 ```
