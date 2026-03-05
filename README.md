@@ -28,10 +28,12 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `search_in_metadata` | Поиск подстроки в метаданных схемы (expressions/defaults/role rules/views) |
 | `where_used_field` | Точечный поиск использования поля по `schema/entity/field` в views/actions/triggers/metadata |
 | `safe_update_view_query` | Безопасный replace в `public.user_views.query` с dry-run и валидацией |
+| `safe_update_action_function` | Безопасный replace в `public.actions.function` с dry-run |
 | `upsert_computed_field` | Создание/обновление computed field с pre-check конфликтов в наследовании |
 | `analyze_module_performance` | Авто-анализ производительности JS-модуля из `admin.modules_table` |
 | `analyze_action_performance` | Авто-анализ производительности OzmaDB action |
 | `analyze_trigger_performance` | Авто-анализ производительности OzmaDB trigger |
+| `analyze_user_view_performance` | Авто-анализ производительности FunQL-запроса именованного user view |
 
 Примечание по модулям: module-tools (`list_modules`, `search_in_modules`, `get_module_code`) читают модули из user view `admin.modules_table` (`/views/by_name/admin/modules_table`), с fallback на entity-путь для старых схем.
 
@@ -163,6 +165,7 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
 ```
 
 Важно: в FunQL не поддерживается `SELECT *`. Нужно перечислять колонки явно.
+И для алиасов используй `AS`: `from public.actions as a` (не `from public.actions a`).
 
 ### Валидация FunQL перед сохранением
 ```
@@ -217,6 +220,8 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
   action_name: send_invoice
   full: true
 ```
+
+Важно: в `public.actions` исходник action хранится в поле `function` (не `code`).
 
 ### Избежать ошибок по полям в `admin` user views
 ```
@@ -280,6 +285,15 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
   max_findings: 20
 ```
 
+### Проанализировать user view на производительность
+```
+Используй analyze_user_view_performance:
+  schema: usr
+  view_name: orders_table
+  include_snippets: true
+  max_findings: 20
+```
+
 ### Безопасная правка user view query
 ```
 Используй safe_update_view_query:
@@ -287,6 +301,16 @@ URI ресурса фиксированный: `ozma://docs/agents` (mime type: 
   view_name: announced_classes_table
   from_text: "contact=>desired_name"
   to_text: "contact=>desired_full_name"
+  dry_run: true
+```
+
+### Безопасная правка кода action (`public.actions.function`)
+```
+Используй safe_update_action_function:
+  schema: sales
+  action_name: publish_actions
+  from_text: "const limit = 100"
+  to_text: "const limit = 200"
   dry_run: true
 ```
 

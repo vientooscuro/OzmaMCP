@@ -225,10 +225,24 @@ def _augment_funql_error(err: dict, query: str) -> dict:
         )
     if "public.actions" in query_l and "unknown field" in message_l:
         err = dict(err)
-        err["hint"] = (
-            "In `public.actions`, use `a.name as action_name` and "
-            "`join public.schemas s on a.schema_id = s.id` for schema name."
-        )
+        if '"code"' in message or ".code" in message_l:
+            err["hint"] = (
+                "In `public.actions`, JavaScript source is stored in `function` (not `code`). "
+                "Use `a.function as code`, `a.name as action_name`, and "
+                "`join public.schemas as s on a.schema_id = s.id` for schema name."
+            )
+        else:
+            err["hint"] = (
+                "In `public.actions`, use `a.name as action_name` and "
+                "`join public.schemas as s on a.schema_id = s.id` for schema name."
+            )
+    if "parse error" in message_l and (" public.actions " in f" {query_l} " or " from public.actions" in query_l):
+        if re.search(r"\b(from|join)\s+public\.actions\s+[a-z_][a-z0-9_]*\b", query_l) and " as " not in query_l:
+            err = dict(err)
+            err["hint"] = (
+                "FunQL aliases should use explicit `AS`. "
+                "Example: `from public.actions as a` (not `from public.actions a`)."
+            )
     if "entity not found" in message_l and "modules_table" in query_l:
         err = dict(err)
         err["hint"] = (
@@ -688,6 +702,23 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="analyze_user_view_performance",
+            description=(
+                "Analyze named user view FunQL performance risks and optimization opportunities. "
+                "Loads query from `public.user_views` and returns prioritized findings."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "View schema, e.g. `crm`"},
+                    "view_name": {"type": "string", "description": "View name"},
+                    "view_id": {"type": "integer", "description": "Optional direct user_view id"},
+                    "include_snippets": {"type": "boolean", "description": "Include short query excerpts in findings (default: true)"},
+                    "max_findings": {"type": "integer", "description": "Max findings to return (default: 20)", "minimum": 1, "maximum": 100},
+                },
+            },
+        ),
+        types.Tool(
             name="transaction",
             description=(
                 "Execute an atomic transaction containing one or more insert/update/delete operations. "
@@ -1047,6 +1078,27 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="safe_update_action_function",
+            description=(
+                "Safely update JavaScript source of an Ozma action by replacing text in `public.actions.function`. "
+                "Use `action_id` or (`schema` + `action_name`). Supports dry-run."
+                + readonly_note
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema": {"type": "string", "description": "Action schema, e.g. `crm`"},
+                    "action_name": {"type": "string", "description": "Action name"},
+                    "action_id": {"type": "integer", "description": "Alternative direct action id"},
+                    "from_text": {"type": "string", "description": "Exact text to replace"},
+                    "to_text": {"type": "string", "description": "Replacement text"},
+                    "replace_count": {"type": "integer", "description": "Optional max replacement count", "minimum": 1},
+                    "dry_run": {"type": "boolean", "description": "If true, do not persist changes"},
+                },
+                "required": ["from_text", "to_text"],
+            },
+        ),
+        types.Tool(
             name="upsert_computed_field",
             description=(
                 "Create or update a computed field in `public.computed_fields` for a target entity. "
@@ -1192,6 +1244,14 @@ async def _dispatch(name: str, args: dict) -> Any:
                 limit=args.get("limit"),
                 offset=args.get("offset"),
             )
+        case "analyze_user_view_performance":
+            return await _tool_analyze_user_view_performance(
+                schema=args.get("schema"),
+                view_name=args.get("view_name"),
+                view_id=args.get("view_id"),
+                include_snippets=args.get("include_snippets", True),
+                max_findings=args.get("max_findings", 20),
+            )
         case "transaction":
             _require_write()
             return await _tool_transaction(_coerce_transaction_operations(args))
@@ -1297,6 +1357,17 @@ async def _dispatch(name: str, args: dict) -> Any:
                 replace_count=args.get("replace_count"),
                 dry_run=args.get("dry_run", False),
                 validate_before_commit=args.get("validate_before_commit", True),
+            )
+        case "safe_update_action_function":
+            _require_write()
+            return await _tool_safe_update_action_function(
+                schema=args.get("schema"),
+                action_name=args.get("action_name"),
+                action_id=args.get("action_id"),
+                from_text=args["from_text"],
+                to_text=args["to_text"],
+                replace_count=args.get("replace_count"),
+                dry_run=args.get("dry_run", False),
             )
         case "upsert_computed_field":
             _require_write()
@@ -1655,6 +1726,26 @@ async def _tool_get_action_code(
         {"schema_name": schema, "action_name": action_name},
     )
     if not rows:
+        same_name = await _tool_funql_query(
+            "{ $action_name string }: "
+            "select s.name as schema_name, a.name as action_name "
+            "from public.actions as a "
+            "join public.schemas as s on a.schema_id = s.id "
+            "where a.name = $action_name "
+            "order by s.name",
+            {"action_name": action_name},
+        )
+        if same_name:
+            schemas = sorted({r.get("schema_name") for r in same_name if r.get("schema_name")})
+            return {
+                "error": f"Action '{schema}.{action_name}' not found",
+                "type": "not_found",
+                "hint": (
+                    f"Action name `{action_name}` exists in schema(s): {', '.join(schemas)}. "
+                    "Use the correct `schema` value, or discover via `list_actions(action_name_like='...')`."
+                ),
+                "candidates": same_name,
+            }
         return {"error": f"Action '{schema}.{action_name}' not found", "type": "not_found"}
     return rows[0]
 
@@ -1990,6 +2081,179 @@ def _analyze_js_performance(code: str, include_snippets: bool = True) -> dict:
     }
 
 
+def _mask_funql_comments(query: str) -> str:
+    def _mask_keep_newlines(match: re.Match) -> str:
+        src = match.group(0)
+        return "".join("\n" if ch == "\n" else " " for ch in src)
+
+    out = re.sub(r"/\*[\s\S]*?\*/", _mask_keep_newlines, query)
+    out = re.sub(r"--[^\n]*", _mask_keep_newlines, out)
+    return out
+
+
+def _analyze_funql_performance(query: str, include_snippets: bool = True) -> dict:
+    findings: list[dict] = []
+    masked = _mask_funql_comments(query)
+    line_count = masked.count("\n") + 1
+
+    metrics = {
+        "line_count": line_count,
+        "char_count": len(query),
+        "join_count": len(re.findall(r"(?i)\b(left|right|inner|outer|cross)?\s*join\b", masked)),
+        "subquery_count": len(re.findall(r"(?i)\(\s*select\b", masked)),
+        "deref_count": len(re.findall(r"=>", masked)),
+        "has_where": bool(re.search(r"(?i)\bwhere\b", masked)),
+        "has_order_by": bool(re.search(r"(?i)\border\s+by\b", masked)),
+        "has_limit": bool(re.search(r"(?i)\blimit\b", masked)),
+        "param_count": len(re.findall(r"(?<!\$)\$[A-Za-z_][A-Za-z0-9_]*", masked)),
+    }
+
+    kind_hits: dict[str, int] = {}
+
+    def _push_from_match(kind: str, severity: str, title: str, detail: str, match: re.Match, max_hits: int = 3) -> None:
+        current = kind_hits.get(kind, 0)
+        if current >= max_hits:
+            return
+        kind_hits[kind] = current + 1
+        snippet = None
+        if include_snippets:
+            snippet = query[max(0, match.start() - 80): min(len(query), match.end() + 120)]
+        findings.append(
+            _make_finding(
+                kind=kind,
+                severity=severity,
+                title=title,
+                detail=detail,
+                line=_line_number_at(query, match.start()),
+                snippet=snippet,
+            )
+        )
+
+    for m in re.finditer(r"(?is)\bselect\s+\*", masked):
+        _push_from_match(
+            "select_star",
+            "high",
+            "SELECT * in user view",
+            "Projects all columns, increasing transferred data and CPU cost. Select only required fields.",
+            m,
+            max_hits=2,
+        )
+
+    for m in re.finditer(r"(?i)\bsub_entity\b", masked):
+        _push_from_match(
+            "sub_entity_read",
+            "high",
+            "Direct sub_entity usage",
+            "Direct `sub_entity` reads can be slow on inherited entities. Prefer OFTYPE/INHERITED FROM checks.",
+            m,
+            max_hits=2,
+        )
+
+    if metrics["has_order_by"] and not metrics["has_limit"]:
+        m = re.search(r"(?i)\border\s+by\b", masked)
+        if m:
+            _push_from_match(
+                "order_without_limit",
+                "medium",
+                "ORDER BY without LIMIT",
+                "Sorting large result sets can be expensive. Add LIMIT for interactive screens or paginate.",
+                m,
+                max_hits=1,
+            )
+
+    for m in re.finditer(r"(?is)\b(in|not\s+in)\s*\(\s*select\b", masked):
+        _push_from_match(
+            "in_subquery",
+            "medium",
+            "IN (SELECT ...) predicate",
+            "Can produce expensive plans on large datasets. Consider EXISTS or a join with selective predicates.",
+            m,
+            max_hits=2,
+        )
+
+    for m in re.finditer(r"(?is)\b(ilike|like)\s+'%[^']*'", masked):
+        _push_from_match(
+            "leading_wildcard_like",
+            "high",
+            "LIKE/ILIKE with leading wildcard",
+            "Predicates like `%term` are usually non-indexable. Consider trigram index or prefix search.",
+            m,
+            max_hits=3,
+        )
+
+    for m in re.finditer(r"(?is)\bwhere\b[\s\S]{0,300}\b(lower|upper|coalesce|trim|date_trunc)\s*\(", masked):
+        _push_from_match(
+            "function_in_filter",
+            "medium",
+            "Function call in WHERE filter",
+            "Wrapping columns with functions in WHERE can disable index usage. Prefer sargable predicates.",
+            m,
+            max_hits=2,
+        )
+
+    if metrics["join_count"] >= 6:
+        m = re.search(r"(?i)\bjoin\b", masked)
+        if m:
+            _push_from_match(
+                "many_joins",
+                "medium",
+                "Many JOINs in one view",
+                f"Detected {metrics['join_count']} joins. Verify join selectivity and indexes on join keys.",
+                m,
+                max_hits=1,
+            )
+
+    if metrics["subquery_count"] >= 4:
+        m = re.search(r"(?is)\(\s*select\b", masked)
+        if m:
+            _push_from_match(
+                "many_subqueries",
+                "medium",
+                "Deep subquery usage",
+                f"Detected {metrics['subquery_count']} subqueries. Consider refactoring into simpler views.",
+                m,
+                max_hits=1,
+            )
+
+    if metrics["param_count"] == 0:
+        literals = len(re.findall(r"'[^']*'", masked)) + len(re.findall(r"(?<![\w$])\d+(?:\.\d+)?(?![\w$])", masked))
+        if literals >= 8:
+            findings.append(
+                _make_finding(
+                    kind="no_params_many_literals",
+                    severity="low",
+                    title="No query parameters detected",
+                    detail=(
+                        "Query appears to inline many literal values. Prefer FunQL args (`$name`) "
+                        "to improve cache hit rates and reduce injection risks."
+                    ),
+                )
+            )
+
+    if re.search(r"(?is)\bselect\s+distinct\b", masked):
+        findings.append(
+            _make_finding(
+                kind="select_distinct",
+                severity="low",
+                title="SELECT DISTINCT used",
+                detail="DISTINCT can require heavy deduplication. Keep it only when duplicates are expected and required.",
+            )
+        )
+
+    severity_rank = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda f: (severity_rank.get(f.get("severity", "low"), 9), f.get("line", 10**9)))
+
+    recommendations = [
+        "Project only required columns instead of `SELECT *`.",
+        "Ensure join/filter columns have supporting indexes.",
+        "Prefer sargable WHERE predicates (avoid functions around indexed columns).",
+        "Use view arguments (`$param`) for cache-friendly reusable queries.",
+        "Paginate with LIMIT/OFFSET for interactive views.",
+    ]
+
+    return {"metrics": metrics, "findings": findings, "recommendations": recommendations}
+
+
 async def _tool_analyze_module_performance(
     module_name: Optional[str] = None,
     module_id: Optional[int] = None,
@@ -2082,6 +2346,43 @@ async def _tool_analyze_trigger_performance(
         "schema_name": trigger.get("schema_name"),
         "entity_name": trigger.get("entity_name"),
         "trigger_name": trigger.get("trigger_name"),
+    }
+    analysis["ok"] = True
+    return analysis
+
+
+async def _tool_analyze_user_view_performance(
+    schema: Optional[str] = None,
+    view_name: Optional[str] = None,
+    view_id: Optional[int] = None,
+    include_snippets: bool = True,
+    max_findings: int = 20,
+) -> dict:
+    user_view = await _tool_get_user_view_query(schema=schema, view_name=view_name, view_id=view_id)
+    if "error" in user_view:
+        return user_view
+    query = user_view.get("query") or ""
+    if not isinstance(query, str) or not query.strip():
+        return {
+            "error": "User view query is empty or unavailable",
+            "type": "no_query",
+            "user_view": {
+                "id": user_view.get("id"),
+                "schema_name": user_view.get("schema_name"),
+                "view_name": user_view.get("view_name"),
+            },
+        }
+    analysis = _analyze_funql_performance(query, include_snippets=include_snippets)
+    findings = analysis.get("findings", [])
+    if len(findings) > max_findings:
+        analysis["findings"] = findings[:max_findings] + [
+            {"kind": "truncated", "severity": "low", "title": "Findings truncated", "detail": f"Returned first {max_findings} findings."}
+        ]
+    analysis["user_view"] = {
+        "id": user_view.get("id"),
+        "schema_name": user_view.get("schema_name"),
+        "view_name": user_view.get("view_name"),
+        "full_name": user_view.get("full_name"),
     }
     analysis["ok"] = True
     return analysis
@@ -2544,6 +2845,105 @@ async def _tool_safe_update_view_query(
         "occurrences": occurrences,
         "applied_replacements": effective_count,
         "validation": validation,
+        "transaction": result,
+    }
+
+
+async def _tool_safe_update_action_function(
+    *,
+    schema: Optional[str] = None,
+    action_name: Optional[str] = None,
+    action_id: Optional[int] = None,
+    from_text: str,
+    to_text: str,
+    replace_count: Optional[int] = None,
+    dry_run: bool = False,
+) -> dict:
+    if action_id is None and (not schema or not action_name):
+        return {
+            "error": "Provide either `action_id` or both `schema` and `action_name`.",
+            "type": "validation",
+            "example": {"schema": "usr", "action_name": "send_invoice", "from_text": "old", "to_text": "new"},
+        }
+
+    if action_id is not None:
+        rows = await _tool_funql_query(
+            "{ $action_id int }: "
+            "select a.id, a.name as action_name, s.name as schema_name, a.function as function "
+            "from public.actions as a "
+            "join public.schemas as s on a.schema_id = s.id "
+            "where a.id = $action_id",
+            {"action_id": action_id},
+        )
+    else:
+        rows = await _tool_funql_query(
+            "{ $schema_name string, $action_name string }: "
+            "select a.id, a.name as action_name, s.name as schema_name, a.function as function "
+            "from public.actions as a "
+            "join public.schemas as s on a.schema_id = s.id "
+            "where s.name = $schema_name and a.name = $action_name",
+            {"schema_name": schema, "action_name": action_name},
+        )
+
+    if not rows:
+        return {
+            "error": (
+                f"Action id={action_id} not found"
+                if action_id is not None
+                else f"Action '{schema}.{action_name}' not found"
+            ),
+            "type": "not_found",
+        }
+
+    row = rows[0]
+    resolved_id = row["id"]
+    resolved_schema = row.get("schema_name")
+    resolved_action_name = row.get("action_name")
+    old_function = row.get("function") or ""
+
+    occurrences = old_function.count(from_text)
+    if occurrences == 0:
+        return {
+            "error": "No occurrences found in action function",
+            "type": "no_match",
+            "action_id": resolved_id,
+            "schema": resolved_schema,
+            "action_name": resolved_action_name,
+            "from_text": from_text,
+        }
+
+    effective_count = replace_count if replace_count is not None else occurrences
+    new_function = old_function.replace(from_text, to_text, replace_count or -1)
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "action_id": resolved_id,
+            "schema": resolved_schema,
+            "action_name": resolved_action_name,
+            "occurrences": occurrences,
+            "planned_replacements": effective_count,
+        }
+
+    result = await _tool_transaction(
+        [
+            {
+                "type": "update",
+                "entity": {"schema": "public", "name": "actions"},
+                "id": resolved_id,
+                "entries": {"function": new_function},
+            }
+        ]
+    )
+    return {
+        "ok": True,
+        "dry_run": False,
+        "action_id": resolved_id,
+        "schema": resolved_schema,
+        "action_name": resolved_action_name,
+        "occurrences": occurrences,
+        "applied_replacements": effective_count,
         "transaction": result,
     }
 
