@@ -1019,6 +1019,51 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="search_http_api_usage",
+            description=(
+                "Find usage of new OzmaDB JavaScript HTTP APIs across action/trigger code: "
+                "`OzmaDB.httpRequest(...)` and `OzmaDB.enqueueHttpRequest(...)` (including legacy `FunDB.*` aliases). "
+                "Useful after OzmaDB runtime upgrade to audit migration to outbox-safe calls."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_legacy_aliases": {
+                        "type": "boolean",
+                        "description": "Also search legacy `FunDB.httpRequest/enqueueHttpRequest` aliases (default true)",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="list_outbox_messages",
+            description=(
+                "Inspect outbox queue (`public.outbox_messages`) used by `OzmaDB.enqueueHttpRequest(...)`. "
+                "Returns status fields (due/locked/completed/attempts/last_error) for delivery diagnostics."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "schema_name": {
+                        "type": "string",
+                        "description": "Optional schema filter (`public.schemas.name`) for messages linked to a schema",
+                    },
+                    "only_pending": {
+                        "type": "boolean",
+                        "description": "If true, show only non-completed messages (default false)",
+                    },
+                    "is_error": {
+                        "type": "boolean",
+                        "description": "If true, only rows with `last_error`; if false, only rows without `last_error`",
+                    },
+                    "method": {"type": "string", "description": "Optional HTTP method filter, e.g. `POST`"},
+                    "url_like": {"type": "string", "description": "Optional case-insensitive substring filter by URL"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "offset": {"type": "integer", "minimum": 0},
+                },
+            },
+        ),
+        types.Tool(
             name="search_in_metadata",
             description=(
                 "Search for a substring inside OzmaDB metadata 'code' fields: "
@@ -1333,6 +1378,18 @@ async def _dispatch(name: str, args: dict) -> Any:
             return await _tool_query_events(args)
         case "search_in_all":
             return await _tool_search_in_all(args["text"])
+        case "search_http_api_usage":
+            return await _tool_search_http_api_usage(include_legacy_aliases=args.get("include_legacy_aliases", True))
+        case "list_outbox_messages":
+            return await _tool_list_outbox_messages(
+                schema_name=args.get("schema_name"),
+                only_pending=args.get("only_pending", False),
+                is_error=args.get("is_error"),
+                method=args.get("method"),
+                url_like=args.get("url_like"),
+                limit=args.get("limit", 100),
+                offset=args.get("offset"),
+            )
         case "search_in_metadata":
             return await _tool_search_in_metadata(args["text"])
         case "where_used_field":
@@ -2524,6 +2581,86 @@ async def _tool_search_in_all(text: str) -> dict:
             "modules": module_error,
         },
     }
+
+
+async def _tool_search_http_api_usage(include_legacy_aliases: bool = True) -> dict:
+    patterns = ["OzmaDB.httpRequest(", "OzmaDB.enqueueHttpRequest("]
+    if include_legacy_aliases:
+        patterns.extend(["FunDB.httpRequest(", "FunDB.enqueueHttpRequest("])
+
+    actions, triggers = await asyncio.gather(
+        _fetch_all_actions(),
+        _fetch_all_triggers(),
+    )
+
+    def _collect(rows: list[dict], name_keys: list[str]) -> list[dict]:
+        found: list[dict] = []
+        for row in rows:
+            code = row.get("code") or ""
+            if not isinstance(code, str) or not code:
+                continue
+            hits = [p for p in patterns if p.lower() in code.lower()]
+            if not hits:
+                continue
+            rec = {k: row.get(k) for k in name_keys}
+            rec["matched_patterns"] = hits
+            rec["excerpt"] = _excerpt(code, hits[0])
+            found.append(rec)
+        return found
+
+    action_hits = _collect(actions, ["schema_name", "action_name"])
+    trigger_hits = _collect(triggers, ["schema_name", "entity_name", "trigger_name"])
+
+    return {
+        "patterns": patterns,
+        "summary": {
+            "actions_with_http_api": len(action_hits),
+            "triggers_with_http_api": len(trigger_hits),
+        },
+        "actions": action_hits,
+        "triggers": trigger_hits,
+        "usage_hint": (
+            "`OzmaDB.httpRequest` performs direct outbound HTTP inside current execution context. "
+            "`OzmaDB.enqueueHttpRequest` writes to outbox for deferred delivery by worker (safer for side effects)."
+        ),
+    }
+
+
+async def _tool_list_outbox_messages(
+    schema_name: Optional[str] = None,
+    only_pending: bool = False,
+    is_error: Optional[bool] = None,
+    method: Optional[str] = None,
+    url_like: Optional[str] = None,
+    limit: Optional[int] = 100,
+    offset: Optional[int] = None,
+) -> list[dict]:
+    params: dict[str, Any] = {
+        "schema_name": schema_name,
+        "method": method,
+        "url_like": f"%{url_like}%" if url_like else None,
+        "only_pending": bool(only_pending),
+        "is_error": is_error,
+    }
+    query = (
+        "{ $schema_name string null, $method string null, $url_like string null, "
+        "$only_pending bool, $is_error bool null }: "
+        "select "
+        "m.id, s.name as schema_name, m.method, m.url, "
+        "m.due_at, m.locked_until, m.completed_at, "
+        "m.attempts, m.max_retries, m.retry_base_delay_ms, "
+        "m.timeout_ms, m.last_status_code, m.last_error, m.created_at "
+        "from public.outbox_messages as m "
+        "left join public.schemas as s on m.schema_id = s.id "
+        "where "
+        "($schema_name is null or s.name = $schema_name) and "
+        "($method is null or upper(m.method) = upper($method)) and "
+        "($url_like is null or m.url ilike $url_like) and "
+        "(not $only_pending or m.completed_at is null) and "
+        "($is_error is null or ($is_error and m.last_error is not null) or (not $is_error and m.last_error is null)) "
+        "order by m.id desc"
+    )
+    return await _tool_funql_query(query, params, limit=limit, offset=offset)
 
 
 async def _safe_funql(query: str, params: dict | None = None) -> list[dict]:

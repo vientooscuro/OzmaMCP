@@ -25,6 +25,8 @@ MCP-сервер для работы с OzmaDB через REST API. Подклю
 | `list_actions` | Список actions с `id/schema_name/action_name` |
 | `list_triggers` | Список triggers с `id/schema_name/entity_name/trigger_name` |
 | `list_entity_fields` | Список полей сущности (column + computed) |
+| `search_http_api_usage` | Поиск использования `OzmaDB.httpRequest(...)` / `OzmaDB.enqueueHttpRequest(...)` в actions/triggers |
+| `list_outbox_messages` | Просмотр состояния outbox-очереди (`public.outbox_messages`) для диагностики доставки |
 | `search_in_metadata` | Поиск подстроки в метаданных схемы (expressions/defaults/role rules/views) |
 | `where_used_field` | Точечный поиск использования поля по `schema/entity/field` в views/actions/triggers/metadata |
 | `safe_update_view_query` | Безопасный replace в `public.user_views.query` с dry-run и валидацией |
