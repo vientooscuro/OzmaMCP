@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1019,6 +1020,29 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="search_js_api_usage",
+            description=(
+                "Find usage of OzmaDB JavaScript runtime APIs across actions/triggers/modules. "
+                "Covers bulk/event/http helpers: "
+                "`runTransaction`, `updateEntries`, `deleteEntries`, `getEntriesByIds`, "
+                "`withMutedEvents`, `muteEvents`, `httpRequest`, `enqueueHttpRequest`. "
+                "Optionally includes legacy `FunDB.*` aliases."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_legacy_aliases": {
+                        "type": "boolean",
+                        "description": "Also search legacy `FunDB.*` aliases (default true)",
+                    },
+                    "include_modules": {
+                        "type": "boolean",
+                        "description": "Also search JS modules from `admin.modules_table` (default true)",
+                    },
+                },
+            },
+        ),
+        types.Tool(
             name="search_http_api_usage",
             description=(
                 "Find usage of new OzmaDB JavaScript HTTP APIs across action/trigger code: "
@@ -1218,40 +1242,42 @@ def _coerce_transaction_operations(args: dict) -> list[dict]:
     def _looks_like_operation(obj: Any) -> bool:
         return isinstance(obj, dict) and any(k in obj for k in ("type", "entity", "entries", "id"))
 
-    def _find_operations_deep(obj: Any, depth: int = 0) -> Optional[list[dict]]:
-        if depth > 6:
-            return None
-        obj = _parse_json_maybe(obj)
-        if isinstance(obj, list):
-            if not obj:
-                return obj
-            if all(isinstance(i, dict) for i in obj) and any(_looks_like_operation(i) for i in obj):
-                return obj
-            for item in obj:
-                found = _find_operations_deep(item, depth + 1)
-                if found is not None:
-                    return found
-            return None
-        if isinstance(obj, dict):
-            # Canonical key first
-            if "operations" in obj:
-                found = _find_operations_deep(obj.get("operations"), depth + 1)
-                if found is not None:
-                    return found
-            # Some clients wrap payload/body/data/params/transaction/etc.
-            for k in ("payload", "raw", "data", "body", "params", "transaction", "tx", "request", "input", "value"):
-                if k in obj:
-                    found = _find_operations_deep(obj.get(k), depth + 1)
-                    if found is not None:
-                        return found
-            # Single operation object
-            if _looks_like_operation(obj):
-                return [obj]
-            # Last resort: inspect all nested values
-            for v in obj.values():
-                found = _find_operations_deep(v, depth + 1)
-                if found is not None:
-                    return found
+    def _find_operations_deep(obj: Any) -> Optional[list[dict]]:
+        # Iterative traversal avoids recursion depth limits and artificial nesting caps.
+        queue = deque([_parse_json_maybe(obj)])
+        seen_ids: set[int] = set()
+        wrapper_keys = ("payload", "raw", "data", "body", "params", "transaction", "tx", "request", "input", "value")
+
+        while queue:
+            current = _parse_json_maybe(queue.popleft())
+            if isinstance(current, (dict, list)):
+                obj_id = id(current)
+                if obj_id in seen_ids:
+                    continue
+                seen_ids.add(obj_id)
+
+            if isinstance(current, list):
+                if not current:
+                    return current
+                if all(isinstance(i, dict) for i in current) and any(_looks_like_operation(i) for i in current):
+                    return current
+                queue.extend(current)
+                continue
+
+            if isinstance(current, dict):
+                # Canonical key first.
+                if "operations" in current:
+                    queue.appendleft(current.get("operations"))
+                # Common wrapper keys used by MCP clients.
+                for k in wrapper_keys:
+                    if k in current:
+                        queue.append(current.get(k))
+                # Single operation object.
+                if _looks_like_operation(current):
+                    return [current]
+                # Last resort: inspect all nested values.
+                queue.extend(current.values())
+
         return None
 
     candidates = [args]
@@ -1378,6 +1404,11 @@ async def _dispatch(name: str, args: dict) -> Any:
             return await _tool_query_events(args)
         case "search_in_all":
             return await _tool_search_in_all(args["text"])
+        case "search_js_api_usage":
+            return await _tool_search_js_api_usage(
+                include_legacy_aliases=args.get("include_legacy_aliases", True),
+                include_modules=args.get("include_modules", True),
+            )
         case "search_http_api_usage":
             return await _tool_search_http_api_usage(include_legacy_aliases=args.get("include_legacy_aliases", True))
         case "list_outbox_messages":
@@ -2583,33 +2614,117 @@ async def _tool_search_in_all(text: str) -> dict:
     }
 
 
-async def _tool_search_http_api_usage(include_legacy_aliases: bool = True) -> dict:
-    patterns = ["OzmaDB.httpRequest(", "OzmaDB.enqueueHttpRequest("]
-    if include_legacy_aliases:
-        patterns.extend(["FunDB.httpRequest(", "FunDB.enqueueHttpRequest("])
+def _collect_js_api_matches(rows: list[dict], patterns: list[str], name_keys: list[str]) -> list[dict]:
+    found: list[dict] = []
+    for row in rows:
+        code = row.get("code") or ""
+        if not isinstance(code, str) or not code:
+            continue
+        hits = [p for p in patterns if p.lower() in code.lower()]
+        if not hits:
+            continue
+        rec = {k: row.get(k) for k in name_keys}
+        rec["matched_patterns"] = hits
+        rec["excerpt"] = _excerpt(code, hits[0])
+        found.append(rec)
+    return found
 
-    actions, triggers = await asyncio.gather(
-        _fetch_all_actions(),
-        _fetch_all_triggers(),
+
+async def _tool_search_js_api_usage(
+    include_legacy_aliases: bool = True,
+    include_modules: bool = True,
+) -> dict:
+    ozma_patterns = [
+        "OzmaDB.runTransaction(",
+        "OzmaDB.updateEntries(",
+        "OzmaDB.deleteEntries(",
+        "OzmaDB.getEntriesByIds(",
+        "OzmaDB.withMutedEvents(",
+        "OzmaDB.muteEvents(",
+        "OzmaDB.httpRequest(",
+        "OzmaDB.enqueueHttpRequest(",
+    ]
+    legacy_patterns: list[str] = []
+    if include_legacy_aliases:
+        legacy_patterns = [
+            "FunDB.runTransaction(",
+            "FunDB.updateEntries(",
+            "FunDB.deleteEntries(",
+            "FunDB.getEntriesByIds(",
+            "FunDB.withMutedEvents(",
+            "FunDB.muteEvents(",
+            "FunDB.httpRequest(",
+            "FunDB.enqueueHttpRequest(",
+        ]
+    patterns = ozma_patterns + legacy_patterns
+
+    tasks: list[Any] = [_fetch_all_actions(), _fetch_all_triggers()]
+    if include_modules:
+        tasks.append(_fetch_all_modules())
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    actions = results[0]
+    triggers = results[1]
+    modules = results[2] if include_modules and len(results) > 2 else []
+
+    action_error = _exception_payload(actions) if isinstance(actions, Exception) else None
+    trigger_error = _exception_payload(triggers) if isinstance(triggers, Exception) else None
+    module_error = _exception_payload(modules) if isinstance(modules, Exception) else None
+    if isinstance(actions, Exception):
+        actions = []
+    if isinstance(triggers, Exception):
+        triggers = []
+    if isinstance(modules, Exception):
+        modules = []
+
+    action_hits = _collect_js_api_matches(actions, patterns, ["schema_name", "action_name"])
+    trigger_hits = _collect_js_api_matches(triggers, patterns, ["schema_name", "entity_name", "trigger_name"])
+    module_hits = (
+        _collect_js_api_matches(modules, patterns, ["id", "name"])
+        if include_modules
+        else []
     )
 
-    def _collect(rows: list[dict], name_keys: list[str]) -> list[dict]:
-        found: list[dict] = []
-        for row in rows:
-            code = row.get("code") or ""
-            if not isinstance(code, str) or not code:
-                continue
-            hits = [p for p in patterns if p.lower() in code.lower()]
-            if not hits:
-                continue
-            rec = {k: row.get(k) for k in name_keys}
-            rec["matched_patterns"] = hits
-            rec["excerpt"] = _excerpt(code, hits[0])
-            found.append(rec)
-        return found
+    counts: dict[str, int] = {}
+    for hit in action_hits + trigger_hits + module_hits:
+        for pattern in hit.get("matched_patterns", []):
+            counts[pattern] = counts.get(pattern, 0) + 1
 
-    action_hits = _collect(actions, ["schema_name", "action_name"])
-    trigger_hits = _collect(triggers, ["schema_name", "entity_name", "trigger_name"])
+    return {
+        "patterns": patterns,
+        "summary": {
+            "actions_with_js_api": len(action_hits),
+            "triggers_with_js_api": len(trigger_hits),
+            "modules_with_js_api": len(module_hits),
+            "pattern_hits": counts,
+        },
+        "actions": action_hits,
+        "triggers": trigger_hits,
+        "modules": module_hits,
+        "errors": {
+            "actions": action_error,
+            "triggers": trigger_error,
+            "modules": module_error if include_modules else None,
+        },
+    }
+
+
+async def _tool_search_http_api_usage(include_legacy_aliases: bool = True) -> dict:
+    payload = await _tool_search_js_api_usage(
+        include_legacy_aliases=include_legacy_aliases,
+        include_modules=False,
+    )
+    patterns = [p for p in payload.get("patterns", []) if "httpRequest" in p or "enqueueHttpRequest" in p]
+    action_hits = [
+        hit
+        for hit in payload.get("actions", [])
+        if any("httpRequest" in p or "enqueueHttpRequest" in p for p in hit.get("matched_patterns", []))
+    ]
+    trigger_hits = [
+        hit
+        for hit in payload.get("triggers", [])
+        if any("httpRequest" in p or "enqueueHttpRequest" in p for p in hit.get("matched_patterns", []))
+    ]
 
     return {
         "patterns": patterns,
@@ -2619,6 +2734,7 @@ async def _tool_search_http_api_usage(include_legacy_aliases: bool = True) -> di
         },
         "actions": action_hits,
         "triggers": trigger_hits,
+        "errors": payload.get("errors", {}),
         "usage_hint": (
             "`OzmaDB.httpRequest` performs direct outbound HTTP inside current execution context. "
             "`OzmaDB.enqueueHttpRequest` writes to outbox for deferred delivery by worker (safer for side effects)."
