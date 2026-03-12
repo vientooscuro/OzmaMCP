@@ -40,6 +40,7 @@ OZMA_MAX_STRING_CHARS = int(os.environ.get("OZMA_MAX_STRING_CHARS", "1500"))
 OZMA_MAX_CODE_CHARS = int(os.environ.get("OZMA_MAX_CODE_CHARS", "4000"))
 OZMA_DOC_COMPACT = os.environ.get("OZMA_DOC_COMPACT", "true").lower() in ("1", "true", "yes")
 OZMA_DOC_MAX_CHARS = int(os.environ.get("OZMA_DOC_MAX_CHARS", "24000"))
+OZMA_REQUEST_THEME = os.environ.get("OZMA_REQUEST_THEME", "")
 
 # Metadata cache TTL in seconds (5 minutes)
 CACHE_TTL = int(os.environ.get("OZMA_CACHE_TTL", "300"))
@@ -102,6 +103,7 @@ def _get_client() -> httpx.AsyncClient:
 
 _access_token: Optional[str] = None
 _token_exp: float = 0.0  # unix timestamp when token expires
+_request_theme: Optional[str] = OZMA_REQUEST_THEME.strip() or None
 
 
 def _jwt_exp(token: str) -> float:
@@ -154,9 +156,12 @@ async def _ensure_token() -> Optional[str]:
 
 
 def _auth_headers() -> dict:
-    if not _access_token:
-        return {}
-    return {"Authorization": f"Bearer {_access_token}"}
+    headers: dict[str, str] = {}
+    if _access_token:
+        headers["Authorization"] = f"Bearer {_access_token}"
+    if _request_theme:
+        headers["X-OzmaDB-Theme"] = _request_theme
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -237,12 +242,14 @@ def _augment_funql_error(err: dict, query: str) -> dict:
                 "In `public.actions`, use `a.name as action_name` and "
                 "`join public.schemas as s on a.schema_id = s.id` for schema name."
             )
-    if "parse error" in message_l and (" public.actions " in f" {query_l} " or " from public.actions" in query_l):
-        if re.search(r"\b(from|join)\s+public\.actions\s+[a-z_][a-z0-9_]*\b", query_l) and " as " not in query_l:
+    if "parse error" in message_l:
+        missing_as = _find_wildcard_from_alias_without_as(query)
+        if missing_as is not None:
             err = dict(err)
             err["hint"] = (
-                "FunQL aliases should use explicit `AS`. "
-                "Example: `from public.actions as a` (not `from public.actions a`)."
+                "For wildcard queries (`select *`), table aliases in `from` must use explicit `as`. "
+                f"Use `from {missing_as['table']} as {missing_as['alias']}` "
+                f"instead of `from {missing_as['table']} {missing_as['alias']}`."
             )
     if "entity not found" in message_l and "modules_table" in query_l:
         err = dict(err)
@@ -274,6 +281,55 @@ def _exception_payload(e: Exception) -> dict:
     except Exception:
         pass
     return {"error": msg, "type": "internal"}
+
+
+_funql_clause_keywords = {
+    "as",
+    "where",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "full",
+    "cross",
+    "group",
+    "order",
+    "limit",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "for",
+    "with",
+}
+
+
+def _find_wildcard_from_alias_without_as(query: str) -> Optional[dict[str, str]]:
+    query_l = (query or "").lower()
+    if not re.search(r"(?is)\bselect\s+\*", query_l):
+        return None
+
+    # For `select *` queries, require explicit `as` in table aliases after `from`.
+    for m in re.finditer(
+        r"""(?is)\bfrom\s+
+            (?P<table>(?:"?[a-z_][a-z0-9_]*"?)(?:\s*\.\s*"?[a-z_][a-z0-9_]*"?)?)
+            \s+
+            (?P<alias>[a-z_][a-z0-9_]*)
+            \b
+        """,
+        query,
+        re.VERBOSE,
+    ):
+        alias = (m.group("alias") or "").lower()
+        if alias in _funql_clause_keywords:
+            continue
+        table = (m.group("table") or "").strip()
+        before_alias = query[m.start("table"):m.start("alias")].lower()
+        if re.search(r"\bas\s+$", before_alias):
+            continue
+        return {"table": table, "alias": m.group("alias")}
+
+    return None
 
 
 async def _get(url: str, params: dict | None = None) -> httpx.Response:
@@ -610,6 +666,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Execute a raw FunQL SELECT query against OzmaDB (anonymous view). "
                 "FunQL is PostgreSQL-like SELECT only — all tables must have explicit schema prefix, e.g. `usr.orders`. "
+                "For wildcard queries (`select *`), aliases in `from` must be explicit via `as` "
+                "(use `from usr.orders as o`, not `from usr.orders o`). "
                 "Pass parameters as a JSON dict — they will be sent as query string args (values JSON-encoded). "
                 "Returns parsed rows as a list of dicts."
             ),
@@ -722,14 +780,13 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="transaction",
             description=(
-                "Execute an atomic transaction containing one or more insert/update/delete operations. "
+                "Execute an atomic transaction containing one or more insert/update/delete/command operations. "
                 "All operations succeed or all are rolled back.\n\n"
                 "Each operation object must have:\n"
-                "- `type`: `\"insert\"` | `\"update\"` | `\"delete\"`\n"
-                "- `entity`: `{\"schema\": str, \"name\": str}`\n"
-                "- `entries`: dict of field values (for insert/update)\n"
-                "- `id`: int record id (for update/delete)\n\n"
-                "Returns list of results; insert results include the new `id`."
+                "- `type`: `\"insert\"` | `\"update\"` | `\"delete\"` | `\"command\"`\n"
+                "- for `insert`/`update`/`delete`: `entity` and relevant fields (`entries`/`id`)\n"
+                "- for `command`: OzmaQL DML in `command` (optional params in `args` or `arguments`)\n\n"
+                "Returns list of results; insert results include the new `id`, command returns `{type:\"command\"}`."
                 + readonly_note
             ),
             inputSchema={
@@ -764,6 +821,22 @@ async def list_tools() -> list[types.Tool]:
             name="check_access",
             description="Verify that the configured credentials are valid and the OzmaDB instance is reachable.",
             inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="set_request_theme",
+            description=(
+                "Set default UI theme sent to OzmaDB in `X-OzmaDB-Theme` header for all subsequent MCP requests. "
+                "Pass null/empty string to clear the override."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "theme": {
+                        "type": ["string", "null"],
+                        "description": "Theme full name, e.g. `admin.light` or `admin.light-glass`",
+                    }
+                },
+            },
         ),
         types.Tool(
             name="validate_funql",
@@ -1295,6 +1368,8 @@ async def _dispatch(name: str, args: dict) -> Any:
     match name:
         case "check_access":
             return await _tool_check_access()
+        case "set_request_theme":
+            return await _tool_set_request_theme(args.get("theme"))
         case "validate_funql":
             return await _tool_validate_funql(args["query"], args.get("params", {}))
         case "funql_query":
@@ -1488,7 +1563,34 @@ async def _tool_check_access() -> dict:
         return {"ok": False, "error": str(e), "type": "network"}
 
 
+async def _tool_set_request_theme(theme: Optional[str]) -> dict:
+    global _request_theme
+
+    previous = _request_theme
+    normalized = (theme or "").strip()
+    _request_theme = normalized if normalized else None
+
+    return {
+        "ok": True,
+        "previous_theme": previous,
+        "current_theme": _request_theme,
+        "header_name": "X-OzmaDB-Theme",
+    }
+
+
 async def _tool_validate_funql(query: str, params: dict | None = None) -> dict:
+    missing_as = _find_wildcard_from_alias_without_as(query)
+    if missing_as is not None:
+        return {
+            "ok": False,
+            "status": 400,
+            "type": "validation",
+            "error": (
+                "For `select *` queries, use explicit `as` for table aliases: "
+                f"`from {missing_as['table']} as {missing_as['alias']}` "
+                f"(not `from {missing_as['table']} {missing_as['alias']}`)."
+            ),
+        }
     qp = {"__query": query.rstrip()}
     qp.update(_json_params(params or {}))
     r = await _get(f"{OZMA_API_BASE}views/anonymous/info", params=qp)
@@ -1507,10 +1609,12 @@ def _apply_pagination(query: str, limit: Optional[int], offset: Optional[int]) -
 
 
 async def _tool_funql_query(query: str, params: dict, limit: Optional[int] = None, offset: Optional[int] = None) -> list[dict]:
-    if re.search(r"(?is)^\s*select\s+\*", query):
+    missing_as = _find_wildcard_from_alias_without_as(query)
+    if missing_as is not None:
         raise ValueError(
-            "FunQL does not support wildcard SELECT (`SELECT *`). "
-            "List columns explicitly, for example: `select id, name from public.column_fields`."
+            "For `select *` queries, use explicit `as` for table aliases: "
+            f"`from {missing_as['table']} as {missing_as['alias']}` "
+            f"(not `from {missing_as['table']} {missing_as['alias']}`)."
         )
     query = _apply_pagination(query.rstrip(), limit, offset)
     qp = {"__query": query}
